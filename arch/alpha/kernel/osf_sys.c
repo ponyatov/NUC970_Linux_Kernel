@@ -96,6 +96,7 @@ struct osf_dirent {
 };
 
 struct osf_dirent_callback {
+	struct dir_context ctx;
 	struct osf_dirent __user *dirent;
 	long __user *basep;
 	unsigned int count;
@@ -146,17 +147,17 @@ SYSCALL_DEFINE4(osf_getdirentries, unsigned int, fd,
 {
 	int error;
 	struct fd arg = fdget(fd);
-	struct osf_dirent_callback buf;
+	struct osf_dirent_callback buf = {
+		.ctx.actor = osf_filldir,
+		.dirent = dirent,
+		.basep = basep,
+		.count = count
+	};
 
 	if (!arg.file)
 		return -EBADF;
 
-	buf.dirent = dirent;
-	buf.basep = basep;
-	buf.count = count;
-	buf.error = 0;
-
-	error = vfs_readdir(arg.file, osf_filldir, &buf);
+	error = iterate_dir(arg.file, &buf.ctx);
 	if (error >= 0)
 		error = buf.error;
 	if (count != buf.count)
@@ -445,7 +446,8 @@ struct procfs_args {
  * unhappy with OSF UFS. [CHECKME]
  */
 static int
-osf_ufs_mount(const char *dirname, struct ufs_args __user *args, int flags)
+osf_ufs_mount(const char __user *dirname,
+	      struct ufs_args __user *args, int flags)
 {
 	int retval;
 	struct cdfs_args tmp;
@@ -465,7 +467,8 @@ osf_ufs_mount(const char *dirname, struct ufs_args __user *args, int flags)
 }
 
 static int
-osf_cdfs_mount(const char *dirname, struct cdfs_args __user *args, int flags)
+osf_cdfs_mount(const char __user *dirname,
+	       struct cdfs_args __user *args, int flags)
 {
 	int retval;
 	struct cdfs_args tmp;
@@ -485,7 +488,8 @@ osf_cdfs_mount(const char *dirname, struct cdfs_args __user *args, int flags)
 }
 
 static int
-osf_procfs_mount(const char *dirname, struct procfs_args __user *args, int flags)
+osf_procfs_mount(const char __user *dirname,
+		 struct procfs_args __user *args, int flags)
 {
 	struct procfs_args tmp;
 
@@ -499,52 +503,41 @@ SYSCALL_DEFINE4(osf_mount, unsigned long, typenr, const char __user *, path,
 		int, flag, void __user *, data)
 {
 	int retval;
-	struct filename *name;
 
-	name = getname(path);
-	retval = PTR_ERR(name);
-	if (IS_ERR(name))
-		goto out;
 	switch (typenr) {
 	case 1:
-		retval = osf_ufs_mount(name->name, data, flag);
+		retval = osf_ufs_mount(path, data, flag);
 		break;
 	case 6:
-		retval = osf_cdfs_mount(name->name, data, flag);
+		retval = osf_cdfs_mount(path, data, flag);
 		break;
 	case 9:
-		retval = osf_procfs_mount(name->name, data, flag);
+		retval = osf_procfs_mount(path, data, flag);
 		break;
 	default:
 		retval = -EINVAL;
 		printk("osf_mount(%ld, %x)\n", typenr, flag);
 	}
-	putname(name);
- out:
+
 	return retval;
 }
 
 SYSCALL_DEFINE1(osf_utsname, char __user *, name)
 {
 	int error;
+	char tmp[5 * 32];
 
 	down_read(&uts_sem);
-	error = -EFAULT;
-	if (copy_to_user(name + 0, utsname()->sysname, 32))
-		goto out;
-	if (copy_to_user(name + 32, utsname()->nodename, 32))
-		goto out;
-	if (copy_to_user(name + 64, utsname()->release, 32))
-		goto out;
-	if (copy_to_user(name + 96, utsname()->version, 32))
-		goto out;
-	if (copy_to_user(name + 128, utsname()->machine, 32))
-		goto out;
+	memcpy(tmp + 0 * 32, utsname()->sysname, 32);
+	memcpy(tmp + 1 * 32, utsname()->nodename, 32);
+	memcpy(tmp + 2 * 32, utsname()->release, 32);
+	memcpy(tmp + 3 * 32, utsname()->version, 32);
+	memcpy(tmp + 4 * 32, utsname()->machine, 32);
+	up_read(&uts_sem);
 
-	error = 0;
- out:
-	up_read(&uts_sem);	
-	return error;
+	if (copy_to_user(name, tmp, sizeof(tmp)))
+		return -EFAULT;
+	return 0;
 }
 
 SYSCALL_DEFINE0(getpagesize)
@@ -562,24 +555,22 @@ SYSCALL_DEFINE0(getdtablesize)
  */
 SYSCALL_DEFINE2(osf_getdomainname, char __user *, name, int, namelen)
 {
-	unsigned len;
-	int i;
+	int len, err = 0;
+	char *kname;
+	char tmp[32];
 
-	if (!access_ok(VERIFY_WRITE, name, namelen))
-		return -EFAULT;
-
-	len = namelen;
-	if (len > 32)
-		len = 32;
+	if (namelen < 0 || namelen > 32)
+		namelen = 32;
 
 	down_read(&uts_sem);
-	for (i = 0; i < len; ++i) {
-		__put_user(utsname()->domainname[i], name + i);
-		if (utsname()->domainname[i] == '\0')
-			break;
-	}
+	kname = utsname()->domainname;
+	len = strnlen(kname, namelen);
+	len = min(len + 1, namelen);
+	memcpy(tmp, kname, len);
 	up_read(&uts_sem);
 
+	if (copy_to_user(name, tmp, len))
+		return -EFAULT;
 	return 0;
 }
 
@@ -742,13 +733,14 @@ SYSCALL_DEFINE3(osf_sysinfo, int, command, char __user *, buf, long, count)
 	};
 	unsigned long offset;
 	const char *res;
-	long len, err = -EINVAL;
+	long len;
+	char tmp[__NEW_UTS_LEN + 1];
 
 	offset = command-1;
 	if (offset >= ARRAY_SIZE(sysinfo_table)) {
 		/* Digital UNIX has a few unpublished interfaces here */
 		printk("sysinfo(%d)", command);
-		goto out;
+		return -EINVAL;
 	}
 
 	down_read(&uts_sem);
@@ -756,13 +748,11 @@ SYSCALL_DEFINE3(osf_sysinfo, int, command, char __user *, buf, long, count)
 	len = strlen(res)+1;
 	if ((unsigned long)len > (unsigned long)count)
 		len = count;
-	if (copy_to_user(buf, res, len))
-		err = -EFAULT;
-	else
-		err = 0;
+	memcpy(tmp, res, len);
 	up_read(&uts_sem);
- out:
-	return err;
+	if (copy_to_user(buf, tmp, len))
+		return -EFAULT;
+	return 0;
 }
 
 SYSCALL_DEFINE5(osf_getsysinfo, unsigned long, op, void __user *, buffer,
@@ -1185,8 +1175,10 @@ SYSCALL_DEFINE4(osf_wait4, pid_t, pid, int __user *, ustatus, int, options,
 	if (!access_ok(VERIFY_WRITE, ur, sizeof(*ur)))
 		return -EFAULT;
 
-	err = 0;
-	err |= put_user(status, ustatus);
+	err = put_user(status, ustatus);
+	if (ret < 0)
+		return err ? err : ret;
+
 	err |= __put_user(r.ru_utime.tv_sec, &ur->ru_utime.tv_sec);
 	err |= __put_user(r.ru_utime.tv_usec, &ur->ru_utime.tv_usec);
 	err |= __put_user(r.ru_stime.tv_sec, &ur->ru_stime.tv_sec);

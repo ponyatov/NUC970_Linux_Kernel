@@ -17,7 +17,6 @@
 
 #include <linux/kernel.h>
 #include <linux/errno.h>
-#include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/tty.h>
 #include <linux/tty_driver.h>
@@ -835,7 +834,6 @@ static void digi_set_termios(struct tty_struct *tty,
 			arg |= DIGI_OUTPUT_FLOW_CONTROL_CTS;
 		} else {
 			arg &= ~DIGI_OUTPUT_FLOW_CONTROL_CTS;
-			tty->hw_stopped = 0;
 		}
 
 		buf[i++] = DIGI_CMD_SET_OUTPUT_FLOW_CONTROL;
@@ -1323,11 +1321,7 @@ static void digi_release(struct usb_serial *serial)
 
 static int digi_port_probe(struct usb_serial_port *port)
 {
-	unsigned port_num;
-
-	port_num = port->number - port->serial->minor;
-
-	return digi_port_init(port, port_num);
+	return digi_port_init(port, port->port_number);
 }
 
 static int digi_port_remove(struct usb_serial_port *port)
@@ -1405,25 +1399,30 @@ static int digi_read_inb_callback(struct urb *urb)
 {
 	struct usb_serial_port *port = urb->context;
 	struct digi_port *priv = usb_get_serial_port_data(port);
-	int opcode = ((unsigned char *)urb->transfer_buffer)[0];
-	int len = ((unsigned char *)urb->transfer_buffer)[1];
-	int port_status = ((unsigned char *)urb->transfer_buffer)[2];
-	unsigned char *data = ((unsigned char *)urb->transfer_buffer) + 3;
+	unsigned char *buf = urb->transfer_buffer;
+	int opcode;
+	int len;
+	int port_status;
+	unsigned char *data;
 	int flag, throttled;
-	int status = urb->status;
-
-	/* do not process callbacks on closed ports */
-	/* but do continue the read chain */
-	if (urb->status == -ENOENT)
-		return 0;
 
 	/* short/multiple packet check */
+	if (urb->actual_length < 2) {
+		dev_warn(&port->dev, "short packet received\n");
+		return -1;
+	}
+
+	opcode = buf[0];
+	len = buf[1];
+
 	if (urb->actual_length != len + 2) {
-		dev_err(&port->dev, "%s: INCOMPLETE OR MULTIPLE PACKET, "
-			"status=%d, port=%d, opcode=%d, len=%d, "
-			"actual_length=%d, status=%d\n", __func__, status,
-			priv->dp_port_num, opcode, len, urb->actual_length,
-			port_status);
+		dev_err(&port->dev, "malformed packet received: port=%d, opcode=%d, len=%d, actual_length=%u\n",
+			priv->dp_port_num, opcode, len, urb->actual_length);
+		return -1;
+	}
+
+	if (opcode == DIGI_CMD_RECEIVE_DATA && len < 1) {
+		dev_err(&port->dev, "malformed data packet received\n");
 		return -1;
 	}
 
@@ -1437,6 +1436,9 @@ static int digi_read_inb_callback(struct urb *urb)
 
 	/* receive data */
 	if (opcode == DIGI_CMD_RECEIVE_DATA) {
+		port_status = buf[2];
+		data = &buf[3];
+
 		/* get flag from port_status */
 		flag = 0;
 
@@ -1528,15 +1530,11 @@ static int digi_read_oob_callback(struct urb *urb)
 			if (val & DIGI_READ_INPUT_SIGNALS_CTS) {
 				priv->dp_modem_signals |= TIOCM_CTS;
 				/* port must be open to use tty struct */
-				if (rts) {
-					tty->hw_stopped = 0;
+				if (rts)
 					tty_port_tty_wakeup(&port->port);
-				}
 			} else {
 				priv->dp_modem_signals &= ~TIOCM_CTS;
 				/* port must be open to use tty struct */
-				if (rts)
-					tty->hw_stopped = 1;
 			}
 			if (val & DIGI_READ_INPUT_SIGNALS_DSR)
 				priv->dp_modem_signals |= TIOCM_DSR;

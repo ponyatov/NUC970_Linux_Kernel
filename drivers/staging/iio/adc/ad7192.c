@@ -206,14 +206,12 @@ static int ad7192_setup(struct ad7192_state *st,
 	struct iio_dev *indio_dev = spi_get_drvdata(st->sd.spi);
 	unsigned long long scale_uv;
 	int i, ret, id;
-	u8 ones[6];
 
 	/* reset the serial interface */
-	memset(&ones, 0xFF, 6);
-	ret = spi_write(st->sd.spi, &ones, 6);
+	ret = ad_sd_reset(&st->sd, 48);
 	if (ret < 0)
 		goto out;
-	msleep(1); /* Wait for at least 500us */
+	usleep_range(500, 1000); /* Wait for at least 500us */
 
 	/* write/read test for device presence */
 	ret = ad_sd_read_reg(&st->sd, AD7192_REG_ID, 1, &id);
@@ -236,7 +234,7 @@ static int ad7192_setup(struct ad7192_state *st,
 			st->mclk = pdata->ext_clk_Hz;
 		else
 			st->mclk = AD7192_INT_FREQ_MHz;
-			break;
+		break;
 	default:
 		ret = -EINVAL;
 		goto out;
@@ -326,7 +324,7 @@ static ssize_t ad7192_write_frequency(struct device *dev,
 	unsigned long lval;
 	int div, ret;
 
-	ret = strict_strtoul(buf, 10, &lval);
+	ret = kstrtoul(buf, 10, &lval);
 	if (ret)
 		return ret;
 	if (lval == 0)
@@ -623,17 +621,17 @@ static int ad7192_probe(struct spi_device *spi)
 		return -ENODEV;
 	}
 
-	indio_dev = iio_device_alloc(sizeof(*st));
+	indio_dev = devm_iio_device_alloc(&spi->dev, sizeof(*st));
 	if (indio_dev == NULL)
 		return -ENOMEM;
 
 	st = iio_priv(indio_dev);
 
-	st->reg = regulator_get(&spi->dev, "vcc");
+	st->reg = devm_regulator_get(&spi->dev, "vcc");
 	if (!IS_ERR(st->reg)) {
 		ret = regulator_enable(st->reg);
 		if (ret)
-			goto error_put_reg;
+			return ret;
 
 		voltage_uv = regulator_get_voltage(st->reg);
 	}
@@ -677,11 +675,6 @@ error_remove_trigger:
 error_disable_reg:
 	if (!IS_ERR(st->reg))
 		regulator_disable(st->reg);
-error_put_reg:
-	if (!IS_ERR(st->reg))
-		regulator_put(st->reg);
-
-	iio_device_free(indio_dev);
 
 	return ret;
 }
@@ -694,10 +687,8 @@ static int ad7192_remove(struct spi_device *spi)
 	iio_device_unregister(indio_dev);
 	ad_sd_cleanup_buffer_and_trigger(indio_dev);
 
-	if (!IS_ERR(st->reg)) {
+	if (!IS_ERR(st->reg))
 		regulator_disable(st->reg);
-		regulator_put(st->reg);
-	}
 
 	return 0;
 }

@@ -161,6 +161,7 @@ struct frame {
 };
 
 struct del_stack {
+	struct dm_btree_info *info;
 	struct dm_transaction_manager *tm;
 	int top;
 	struct frame spine[MAX_SPINE_DEPTH];
@@ -181,6 +182,20 @@ static int top_frame(struct del_stack *s, struct frame **f)
 static int unprocessed_frames(struct del_stack *s)
 {
 	return s->top >= 0;
+}
+
+static void prefetch_children(struct del_stack *s, struct frame *f)
+{
+	unsigned i;
+	struct dm_block_manager *bm = dm_tm_get_bm(s->tm);
+
+	for (i = 0; i < f->nr_children; i++)
+		dm_bm_prefetch(bm, value64(f->n, i));
+}
+
+static bool is_internal_level(struct dm_btree_info *info, struct frame *f)
+{
+	return f->level < (info->levels - 1);
 }
 
 static int push_frame(struct del_stack *s, dm_block_t b, unsigned level)
@@ -205,6 +220,7 @@ static int push_frame(struct del_stack *s, dm_block_t b, unsigned level)
 		dm_tm_dec(s->tm, b);
 
 	else {
+		uint32_t flags;
 		struct frame *f = s->spine + ++s->top;
 
 		r = dm_tm_read_lock(s->tm, b, &btree_node_validator, &f->b);
@@ -217,6 +233,10 @@ static int push_frame(struct del_stack *s, dm_block_t b, unsigned level)
 		f->level = level;
 		f->nr_children = le32_to_cpu(f->n->header.nr_entries);
 		f->current_child = 0;
+
+		flags = le32_to_cpu(f->n->header.flags);
+		if (flags & INTERNAL_NODE || is_internal_level(s->info, f))
+			prefetch_children(s, f);
 	}
 
 	return 0;
@@ -230,21 +250,6 @@ static void pop_frame(struct del_stack *s)
 	dm_tm_unlock(s->tm, f->b);
 }
 
-static bool is_internal_level(struct dm_btree_info *info, struct frame *f)
-{
-	return f->level < (info->levels - 1);
-}
-
-static void unlock_all_frames(struct del_stack *s)
-{
-	struct frame *f;
-
-	while (unprocessed_frames(s)) {
-		f = s->spine + s->top--;
-		dm_tm_unlock(s->tm, f->b);
-	}
-}
-
 int dm_btree_del(struct dm_btree_info *info, dm_block_t root)
 {
 	int r;
@@ -253,6 +258,7 @@ int dm_btree_del(struct dm_btree_info *info, dm_block_t root)
 	s = kmalloc(sizeof(*s), GFP_NOIO);
 	if (!s)
 		return -ENOMEM;
+	s->info = info;
 	s->tm = info->tm;
 	s->top = -1;
 
@@ -297,16 +303,12 @@ int dm_btree_del(struct dm_btree_info *info, dm_block_t root)
 					info->value_type.dec(info->value_type.context,
 							     value_ptr(f->n, i));
 			}
-			f->current_child = f->nr_children;
+			pop_frame(s);
 		}
 	}
-out:
-	if (r) {
-		/* cleanup all frames of del_stack */
-		unlock_all_frames(s);
-	}
-	kfree(s);
 
+out:
+	kfree(s);
 	return r;
 }
 EXPORT_SYMBOL_GPL(dm_btree_del);
@@ -469,10 +471,8 @@ static int btree_split_sibling(struct shadow_spine *s, dm_block_t root,
 
 	r = insert_at(sizeof(__le64), pn, parent_index + 1,
 		      le64_to_cpu(rn->keys[0]), &location);
-	if (r) {
-		unlock_block(s->info, right);
+	if (r)
 		return r;
-	}
 
 	if (key < le64_to_cpu(rn->keys[0])) {
 		unlock_block(s->info, right);
@@ -572,23 +572,8 @@ static int btree_split_beneath(struct shadow_spine *s, uint64_t key)
 	pn->keys[1] = rn->keys[0];
 	memcpy_disk(value_ptr(pn, 1), &val, sizeof(__le64));
 
-	/*
-	 * rejig the spine.  This is ugly, since it knows too
-	 * much about the spine
-	 */
-	if (s->nodes[0] != new_parent) {
-		unlock_block(s->info, s->nodes[0]);
-		s->nodes[0] = new_parent;
-	}
-	if (key < le64_to_cpu(rn->keys[0])) {
-		unlock_block(s->info, right);
-		s->nodes[1] = left;
-	} else {
-		unlock_block(s->info, left);
-		s->nodes[1] = right;
-	}
-	s->count = 2;
-
+	unlock_block(s->info, left);
+	unlock_block(s->info, right);
 	return 0;
 }
 
@@ -765,8 +750,8 @@ EXPORT_SYMBOL_GPL(dm_btree_insert_notify);
 
 /*----------------------------------------------------------------*/
 
-static int find_highest_key(struct ro_spine *s, dm_block_t block,
-			    uint64_t *result_key, dm_block_t *next_block)
+static int find_key(struct ro_spine *s, dm_block_t block, bool find_highest,
+		    uint64_t *result_key, dm_block_t *next_block)
 {
 	int i, r;
 	uint32_t flags;
@@ -783,9 +768,17 @@ static int find_highest_key(struct ro_spine *s, dm_block_t block,
 		else
 			i--;
 
-		*result_key = le64_to_cpu(ro_node(s)->keys[i]);
-		if (next_block || flags & INTERNAL_NODE)
-			block = value64(ro_node(s), i);
+		if (find_highest)
+			*result_key = le64_to_cpu(ro_node(s)->keys[i]);
+		else
+			*result_key = le64_to_cpu(ro_node(s)->keys[0]);
+
+		if (next_block || flags & INTERNAL_NODE) {
+			if (find_highest)
+				block = value64(ro_node(s), i);
+			else
+				block = value64(ro_node(s), 0);
+		}
 
 	} while (flags & INTERNAL_NODE);
 
@@ -794,16 +787,16 @@ static int find_highest_key(struct ro_spine *s, dm_block_t block,
 	return 0;
 }
 
-int dm_btree_find_highest_key(struct dm_btree_info *info, dm_block_t root,
-			      uint64_t *result_keys)
+static int dm_btree_find_key(struct dm_btree_info *info, dm_block_t root,
+			     bool find_highest, uint64_t *result_keys)
 {
 	int r = 0, count = 0, level;
 	struct ro_spine spine;
 
 	init_ro_spine(&spine, info);
 	for (level = 0; level < info->levels; level++) {
-		r = find_highest_key(&spine, root, result_keys + level,
-				     level == info->levels - 1 ? NULL : &root);
+		r = find_key(&spine, root, find_highest, result_keys + level,
+			     level == info->levels - 1 ? NULL : &root);
 		if (r == -ENODATA) {
 			r = 0;
 			break;
@@ -817,7 +810,22 @@ int dm_btree_find_highest_key(struct dm_btree_info *info, dm_block_t root,
 
 	return r ? r : count;
 }
+
+int dm_btree_find_highest_key(struct dm_btree_info *info, dm_block_t root,
+			      uint64_t *result_keys)
+{
+	return dm_btree_find_key(info, root, true, result_keys);
+}
 EXPORT_SYMBOL_GPL(dm_btree_find_highest_key);
+
+int dm_btree_find_lowest_key(struct dm_btree_info *info, dm_block_t root,
+			     uint64_t *result_keys)
+{
+	return dm_btree_find_key(info, root, false, result_keys);
+}
+EXPORT_SYMBOL_GPL(dm_btree_find_lowest_key);
+
+/*----------------------------------------------------------------*/
 
 /*
  * FIXME: We shouldn't use a recursive algorithm when we have limited stack

@@ -254,12 +254,14 @@ static void pppol2tp_recv(struct l2tp_session *session, struct sk_buff *skb, int
 		po = pppox_sk(sk);
 		ppp_input(&po->chan, skb);
 	} else {
-		l2tp_info(session, PPPOL2TP_MSG_DATA, "%s: socket not bound\n",
-			  session->name);
+		l2tp_dbg(session, PPPOL2TP_MSG_DATA,
+			 "%s: recv %d byte data frame, passing to L2TP socket\n",
+			 session->name, data_len);
 
-		/* Not bound. Nothing we can do, so discard. */
-		atomic_long_inc(&session->stats.rx_errors);
-		kfree_skb(skb);
+		if (sock_queue_rcv_skb(sk, skb) < 0) {
+			atomic_long_inc(&session->stats.rx_errors);
+			kfree_skb(skb);
+		}
 	}
 
 	return;
@@ -454,13 +456,11 @@ static void pppol2tp_session_close(struct l2tp_session *session)
 
 	BUG_ON(session->magic != L2TP_SESSION_MAGIC);
 
-
 	if (sock) {
 		inet_shutdown(sock, 2);
 		/* Don't let the session go away before our socket does */
 		l2tp_session_inc_refcount(session);
 	}
-	return;
 }
 
 /* Really kill the session socket. (Called from sock_put() if
@@ -469,12 +469,15 @@ static void pppol2tp_session_close(struct l2tp_session *session)
 static void pppol2tp_session_destruct(struct sock *sk)
 {
 	struct l2tp_session *session = sk->sk_user_data;
+
+	skb_queue_purge(&sk->sk_receive_queue);
+	skb_queue_purge(&sk->sk_write_queue);
+
 	if (session) {
 		sk->sk_user_data = NULL;
 		BUG_ON(session->magic != L2TP_SESSION_MAGIC);
 		l2tp_session_dec_refcount(session);
 	}
-	return;
 }
 
 /* Called when the PPPoX socket (session) is closed.
@@ -508,9 +511,6 @@ static int pppol2tp_release(struct socket *sock)
 		l2tp_session_queue_purge(session);
 		sock_put(sk);
 	}
-	skb_queue_purge(&sk->sk_receive_queue);
-	skb_queue_purge(&sk->sk_write_queue);
-
 	release_sock(sk);
 
 	/* This will delete the session context via
@@ -608,6 +608,13 @@ static int pppol2tp_connect(struct socket *sock, struct sockaddr *uservaddr,
 	lock_sock(sk);
 
 	error = -EINVAL;
+
+	if (sockaddr_len != sizeof(struct sockaddr_pppol2tp) &&
+	    sockaddr_len != sizeof(struct sockaddr_pppol2tpv3) &&
+	    sockaddr_len != sizeof(struct sockaddr_pppol2tpin6) &&
+	    sockaddr_len != sizeof(struct sockaddr_pppol2tpv3in6))
+		goto end;
+
 	if (sp->sa_protocol != PX_PROTO_OL2TP)
 		goto end;
 
@@ -909,8 +916,8 @@ static int pppol2tp_getname(struct socket *sock, struct sockaddr *uaddr,
 #if IS_ENABLED(CONFIG_IPV6)
 	} else if ((tunnel->version == 2) &&
 		   (tunnel->sock->sk_family == AF_INET6)) {
-		struct ipv6_pinfo *np = inet6_sk(tunnel->sock);
 		struct sockaddr_pppol2tpin6 sp;
+
 		len = sizeof(sp);
 		memset(&sp, 0, len);
 		sp.sa_family	= AF_PPPOX;
@@ -923,13 +930,13 @@ static int pppol2tp_getname(struct socket *sock, struct sockaddr *uaddr,
 		sp.pppol2tp.d_session = session->peer_session_id;
 		sp.pppol2tp.addr.sin6_family = AF_INET6;
 		sp.pppol2tp.addr.sin6_port = inet->inet_dport;
-		memcpy(&sp.pppol2tp.addr.sin6_addr, &np->daddr,
-		       sizeof(np->daddr));
+		memcpy(&sp.pppol2tp.addr.sin6_addr, &tunnel->sock->sk_v6_daddr,
+		       sizeof(tunnel->sock->sk_v6_daddr));
 		memcpy(uaddr, &sp, len);
 	} else if ((tunnel->version == 3) &&
 		   (tunnel->sock->sk_family == AF_INET6)) {
-		struct ipv6_pinfo *np = inet6_sk(tunnel->sock);
 		struct sockaddr_pppol2tpv3in6 sp;
+
 		len = sizeof(sp);
 		memset(&sp, 0, len);
 		sp.sa_family	= AF_PPPOX;
@@ -942,8 +949,8 @@ static int pppol2tp_getname(struct socket *sock, struct sockaddr *uaddr,
 		sp.pppol2tp.d_session = session->peer_session_id;
 		sp.pppol2tp.addr.sin6_family = AF_INET6;
 		sp.pppol2tp.addr.sin6_port = inet->inet_dport;
-		memcpy(&sp.pppol2tp.addr.sin6_addr, &np->daddr,
-		       sizeof(np->daddr));
+		memcpy(&sp.pppol2tp.addr.sin6_addr, &tunnel->sock->sk_v6_daddr,
+		       sizeof(tunnel->sock->sk_v6_daddr));
 		memcpy(uaddr, &sp, len);
 #endif
 	} else if (tunnel->version == 3) {
@@ -1017,6 +1024,9 @@ static int pppol2tp_session_ioctl(struct l2tp_session *session,
 		 session->name, cmd, arg);
 
 	sk = ps->sock;
+	if (!sk)
+		return -EBADR;
+
 	sock_hold(sk);
 
 	switch (cmd) {
@@ -1313,6 +1323,7 @@ static int pppol2tp_session_setsockopt(struct sock *sk,
 			po->chan.hdrlen = val ? PPPOL2TP_L2TP_HDR_SIZE_SEQ :
 				PPPOL2TP_L2TP_HDR_SIZE_NOSEQ;
 		}
+		l2tp_session_set_header_len(session, session->tunnel->version);
 		l2tp_info(session, PPPOL2TP_MSG_CONTROL,
 			  "%s: set send_seq=%d\n",
 			  session->name, session->send_seq);
@@ -1576,7 +1587,7 @@ static void pppol2tp_next_tunnel(struct net *net, struct pppol2tp_seq_data *pd)
 
 static void pppol2tp_next_session(struct net *net, struct pppol2tp_seq_data *pd)
 {
-	pd->session = l2tp_session_get_nth(pd->tunnel, pd->session_idx, true);
+	pd->session = l2tp_session_find_nth(pd->tunnel, pd->session_idx);
 	pd->session_idx++;
 
 	if (pd->session == NULL) {
@@ -1703,14 +1714,10 @@ static int pppol2tp_seq_show(struct seq_file *m, void *v)
 
 	/* Show the tunnel or session context.
 	 */
-	if (!pd->session) {
+	if (pd->session == NULL)
 		pppol2tp_seq_tunnel_show(m, pd->tunnel);
-	} else {
+	else
 		pppol2tp_seq_session_show(m, pd->session);
-		if (pd->session->deref)
-			pd->session->deref(pd->session);
-		l2tp_session_dec_refcount(pd->session);
-	}
 
 out:
 	return 0;

@@ -1078,7 +1078,8 @@ static void ldc_iommu_release(struct ldc_channel *lp)
 
 struct ldc_channel *ldc_alloc(unsigned long id,
 			      const struct ldc_channel_config *cfgp,
-			      void *event_arg)
+			      void *event_arg,
+			      const char *name)
 {
 	struct ldc_channel *lp;
 	const struct ldc_mode_ops *mops;
@@ -1092,6 +1093,8 @@ struct ldc_channel *ldc_alloc(unsigned long id,
 
 	err = -EINVAL;
 	if (!cfgp)
+		goto out_err;
+	if (!name)
 		goto out_err;
 
 	switch (cfgp->mode) {
@@ -1185,6 +1188,21 @@ struct ldc_channel *ldc_alloc(unsigned long id,
 
 	INIT_HLIST_HEAD(&lp->mh_list);
 
+	snprintf(lp->rx_irq_name, LDC_IRQ_NAME_MAX, "%s RX", name);
+	snprintf(lp->tx_irq_name, LDC_IRQ_NAME_MAX, "%s TX", name);
+
+	err = request_irq(lp->cfg.rx_irq, ldc_rx, 0,
+			  lp->rx_irq_name, lp);
+	if (err)
+		goto out_free_txq;
+
+	err = request_irq(lp->cfg.tx_irq, ldc_tx, 0,
+			  lp->tx_irq_name, lp);
+	if (err) {
+		free_irq(lp->cfg.rx_irq, lp);
+		goto out_free_txq;
+	}
+
 	return lp;
 
 out_free_txq:
@@ -1237,30 +1255,13 @@ EXPORT_SYMBOL(ldc_free);
  * state.  This does not initiate a handshake, ldc_connect() does
  * that.
  */
-int ldc_bind(struct ldc_channel *lp, const char *name)
+int ldc_bind(struct ldc_channel *lp)
 {
 	unsigned long hv_err, flags;
 	int err = -EINVAL;
 
-	if (!name ||
-	    (lp->state != LDC_STATE_INIT))
+	if (lp->state != LDC_STATE_INIT)
 		return -EINVAL;
-
-	snprintf(lp->rx_irq_name, LDC_IRQ_NAME_MAX, "%s RX", name);
-	snprintf(lp->tx_irq_name, LDC_IRQ_NAME_MAX, "%s TX", name);
-
-	err = request_irq(lp->cfg.rx_irq, ldc_rx, IRQF_DISABLED,
-			  lp->rx_irq_name, lp);
-	if (err)
-		return err;
-
-	err = request_irq(lp->cfg.tx_irq, ldc_tx, IRQF_DISABLED,
-			  lp->tx_irq_name, lp);
-	if (err) {
-		free_irq(lp->cfg.rx_irq, lp);
-		return err;
-	}
-
 
 	spin_lock_irqsave(&lp->lock, flags);
 
@@ -1692,9 +1693,14 @@ static int read_nonraw(struct ldc_channel *lp, void *buf, unsigned int size)
 
 		lp->rcv_nxt = p->seqid;
 
+		/*
+		 * If this is a control-only packet, there is nothing
+		 * else to do but advance the rx queue since the packet
+		 * was already processed above.
+		 */
 		if (!(p->type & LDC_DATA)) {
 			new = rx_advance(lp, new);
-			goto no_data;
+			break;
 		}
 		if (p->stype & (LDC_ACK | LDC_NACK)) {
 			err = data_ack_nack(lp, p);
@@ -2159,7 +2165,7 @@ int ldc_map_single(struct ldc_channel *lp,
 	state.pte_idx = (base - iommu->page_table);
 	state.nc = 0;
 	fill_cookies(&state, (pa & PAGE_MASK), (pa & ~PAGE_MASK), len);
-	BUG_ON(state.nc != 1);
+	BUG_ON(state.nc > ncookies);
 
 	return state.nc;
 }

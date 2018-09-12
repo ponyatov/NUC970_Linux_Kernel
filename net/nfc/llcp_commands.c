@@ -12,9 +12,7 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the
- * Free Software Foundation, Inc.,
- * 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+ * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 #define pr_fmt(fmt) "llcp: %s: " fmt, __func__
@@ -150,6 +148,10 @@ struct nfc_llcp_sdp_tlv *nfc_llcp_build_sdreq_tlv(u8 tid, char *uri,
 	struct nfc_llcp_sdp_tlv *sdreq;
 
 	pr_debug("uri: %s, len: %zu\n", uri, uri_len);
+
+	/* sdreq->tlv_len is u8, takes uri_len, + 3 for header, + 1 for NULL */
+	if (WARN_ON_ONCE(uri_len > U8_MAX - 4))
+		return NULL;
 
 	sdreq = kzalloc(sizeof(struct nfc_llcp_sdp_tlv), GFP_KERNEL);
 	if (sdreq == NULL)
@@ -339,7 +341,7 @@ static struct sk_buff *llcp_allocate_pdu(struct nfc_llcp_sock *sock,
 	return skb;
 }
 
-int nfc_llcp_disconnect(struct nfc_llcp_sock *sock)
+int nfc_llcp_send_disconnect(struct nfc_llcp_sock *sock)
 {
 	struct sk_buff *skb;
 	struct nfc_dev *dev;
@@ -389,7 +391,7 @@ int nfc_llcp_send_symm(struct nfc_dev *dev)
 
 	__net_timestamp(skb);
 
-	nfc_llcp_send_to_raw_sock(local, skb, NFC_LLCP_DIRECTION_TX);
+	nfc_llcp_send_to_raw_sock(local, skb, NFC_DIRECTION_TX);
 
 	return nfc_data_exchange(dev, local->target_idx, skb,
 				 nfc_llcp_recv, local);
@@ -630,26 +632,6 @@ int nfc_llcp_send_dm(struct nfc_llcp_local *local, u8 ssap, u8 dsap, u8 reason)
 	return 0;
 }
 
-int nfc_llcp_send_disconnect(struct nfc_llcp_sock *sock)
-{
-	struct sk_buff *skb;
-	struct nfc_llcp_local *local;
-
-	pr_debug("Send DISC\n");
-
-	local = sock->local;
-	if (local == NULL)
-		return -ENODEV;
-
-	skb = llcp_allocate_pdu(sock, LLCP_PDU_DISC, 0);
-	if (skb == NULL)
-		return -ENOMEM;
-
-	skb_queue_head(&local->tx_queue, skb);
-
-	return 0;
-}
-
 int nfc_llcp_send_i_frame(struct nfc_llcp_sock *sock,
 			  struct msghdr *msg, size_t len)
 {
@@ -697,7 +679,7 @@ int nfc_llcp_send_i_frame(struct nfc_llcp_sock *sock,
 
 	do {
 		remote_miu = sock->remote_miu > LLCP_MAX_MIU ?
-				local->remote_miu : sock->remote_miu;
+				LLCP_DEFAULT_MIU : sock->remote_miu;
 
 		frag_len = min_t(size_t, remote_miu, remaining_len);
 
@@ -706,8 +688,10 @@ int nfc_llcp_send_i_frame(struct nfc_llcp_sock *sock,
 
 		pdu = llcp_allocate_pdu(sock, LLCP_PDU_I,
 					frag_len + LLCP_SEQUENCE_SIZE);
-		if (pdu == NULL)
+		if (pdu == NULL) {
+			kfree(msg_data);
 			return -ENOMEM;
+		}
 
 		skb_put(pdu, LLCP_SEQUENCE_SIZE);
 
@@ -768,11 +752,14 @@ int nfc_llcp_send_ui_frame(struct nfc_llcp_sock *sock, u8 ssap, u8 dsap,
 		pr_debug("Fragment %zd bytes remaining %zd",
 			 frag_len, remaining_len);
 
-		pdu = nfc_alloc_send_skb(sock->dev, &sock->sk, MSG_DONTWAIT,
+		pdu = nfc_alloc_send_skb(sock->dev, &sock->sk, 0,
 					 frag_len + LLCP_HEADER_SIZE, &err);
 		if (pdu == NULL) {
-			pr_err("Could not allocate PDU\n");
-			continue;
+			pr_err("Could not allocate PDU (error=%d)\n", err);
+			len -= remaining_len;
+			if (len == 0)
+				len = err;
+			break;
 		}
 
 		pdu = llcp_add_header(pdu, dsap, ssap, LLCP_PDU_UI);

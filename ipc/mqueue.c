@@ -6,7 +6,7 @@
  *
  * Spinlocks:               Mohamed Abbas           (abbas.mohamed@intel.com)
  * Lockless receive & send, fd based notify:
- * 			    Manfred Spraul	    (manfred@colorfullife.com)
+ *			    Manfred Spraul	    (manfred@colorfullife.com)
  *
  * Audit:                   George Wilson           (ltcgcw@us.ibm.com)
  *
@@ -73,7 +73,7 @@ struct mqueue_inode_info {
 	struct mq_attr attr;
 
 	struct sigevent notify;
-	struct pid* notify_owner;
+	struct pid *notify_owner;
 	struct user_namespace *notify_user_ns;
 	struct user_struct *user;	/* user who created, for accounting */
 	struct sock *notify_sock;
@@ -92,7 +92,7 @@ static void remove_notification(struct mqueue_inode_info *info);
 
 static struct kmem_cache *mqueue_inode_cachep;
 
-static struct ctl_table_header * mq_sysctl_table;
+static struct ctl_table_header *mq_sysctl_table;
 
 static inline struct mqueue_inode_info *MQUEUE_I(struct inode *inode)
 {
@@ -463,13 +463,13 @@ out_unlock:
 
 static int mqueue_unlink(struct inode *dir, struct dentry *dentry)
 {
-  	struct inode *inode = dentry->d_inode;
+	struct inode *inode = dentry->d_inode;
 
 	dir->i_ctime = dir->i_mtime = dir->i_atime = CURRENT_TIME;
 	dir->i_size -= DIRENT_SIZE;
-  	drop_nlink(inode);
-  	dput(dentry);
-  	return 0;
+	drop_nlink(inode);
+	dput(dentry);
+	return 0;
 }
 
 /*
@@ -619,7 +619,7 @@ static struct ext_wait_queue *wq_get_first_waiter(
 
 static inline void set_cookie(struct sk_buff *skb, char code)
 {
-	((char*)skb->data)[NOTIFY_COOKIE_LEN-1] = code;
+	((char *)skb->data)[NOTIFY_COOKIE_LEN-1] = code;
 }
 
 /*
@@ -883,7 +883,7 @@ SYSCALL_DEFINE1(mq_unlink, const char __user *, u_name)
 		err = -ENOENT;
 	} else {
 		ihold(inode);
-		err = vfs_unlink(dentry->d_parent->d_inode, dentry);
+		err = vfs_unlink(dentry->d_parent->d_inode, dentry, NULL);
 	}
 	dput(dentry);
 
@@ -1239,8 +1239,10 @@ retry:
 
 			timeo = MAX_SCHEDULE_TIMEOUT;
 			ret = netlink_attachskb(sock, nc, &timeo, NULL);
-			if (ret == 1)
+			if (ret == 1) {
+				sock = NULL;
 				goto retry;
+			}
 			if (ret) {
 				sock = NULL;
 				nc = NULL;
@@ -1298,11 +1300,11 @@ retry:
 out_fput:
 	fdput(f);
 out:
-	if (sock) {
+	if (sock)
 		netlink_detachskb(sock, nc);
-	} else if (nc) {
+	else if (nc)
 		dev_kfree_skb(nc);
-	}
+
 	return ret;
 }
 
@@ -1454,4 +1456,4 @@ out_sysctl:
 	return error;
 }
 
-__initcall(init_mqueue_fs);
+device_initcall(init_mqueue_fs);

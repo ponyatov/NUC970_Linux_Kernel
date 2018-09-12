@@ -153,7 +153,7 @@ void snd_ctl_notify(struct snd_card *card, unsigned int mask,
 	if (card->shutdown)
 		return;
 	read_lock(&card->ctl_files_rwlock);
-#if defined(CONFIG_SND_MIXER_OSS) || defined(CONFIG_SND_MIXER_OSS_MODULE)
+#if IS_ENABLED(CONFIG_SND_MIXER_OSS)
 	card->mixer_oss_change_count++;
 #endif
 	list_for_each_entry(ctl, &card->ctl_files, list) {
@@ -172,7 +172,7 @@ void snd_ctl_notify(struct snd_card *card, unsigned int mask,
 			ev->mask = mask;
 			list_add_tail(&ev->list, &ctl->events);
 		} else {
-			snd_printk(KERN_ERR "No memory available to allocate event\n");
+			dev_err(card->dev, "No memory available to allocate event\n");
 		}
 	_found:
 		wake_up(&ctl->change_sleep);
@@ -208,7 +208,7 @@ static struct snd_kcontrol *snd_ctl_new(struct snd_kcontrol *control,
 
 	kctl = kzalloc(sizeof(*kctl) + sizeof(struct snd_kcontrol_volatile) * control->count, GFP_KERNEL);
 	if (kctl == NULL) {
-		snd_printk(KERN_ERR "Cannot allocate control instance\n");
+		pr_err("ALSA: Cannot allocate control instance\n");
 		return NULL;
 	}
 	*kctl = *control;
@@ -243,9 +243,8 @@ struct snd_kcontrol *snd_ctl_new1(const struct snd_kcontrol_new *ncontrol,
 	if (ncontrol->name) {
 		strlcpy(kctl.id.name, ncontrol->name, sizeof(kctl.id.name));
 		if (strcmp(ncontrol->name, kctl.id.name) != 0)
-			snd_printk(KERN_WARNING
-				   "Control name '%s' truncated to '%s'\n",
-				   ncontrol->name, kctl.id.name);
+			pr_warn("ALSA: Control name '%s' truncated to '%s'\n",
+				ncontrol->name, kctl.id.name);
 	}
 	kctl.id.index = ncontrol->index;
 	kctl.count = ncontrol->count ? ncontrol->count : 1;
@@ -312,7 +311,7 @@ static int snd_ctl_find_hole(struct snd_card *card, unsigned int count)
 	while (snd_ctl_remove_numid_conflict(card, count)) {
 		if (--iter == 0) {
 			/* this situation is very unlikely */
-			snd_printk(KERN_ERR "unable to allocate new control numid\n");
+			dev_err(card->dev, "unable to allocate new control numid\n");
 			return -ENOMEM;
 		}
 	}
@@ -351,7 +350,7 @@ int snd_ctl_add(struct snd_card *card, struct snd_kcontrol *kcontrol)
 	down_write(&card->controls_rwsem);
 	if (snd_ctl_find_id(card, &id)) {
 		up_write(&card->controls_rwsem);
-		snd_printd(KERN_ERR "control %i:%i:%i:%s:%i is already present\n",
+		dev_err(card->dev, "control %i:%i:%i:%s:%i is already present\n",
 					id.iface,
 					id.device,
 					id.subdevice,
@@ -1327,8 +1326,6 @@ static int snd_ctl_tlv_ioctl(struct snd_ctl_file *file,
 		return -EFAULT;
 	if (tlv.length < sizeof(unsigned int) * 2)
 		return -EINVAL;
-	if (!tlv.numid)
-		return -EINVAL;
 	down_read(&card->controls_rwsem);
 	kctl = snd_ctl_find_numid(card, tlv.numid);
 	if (kctl == NULL) {
@@ -1415,11 +1412,11 @@ static long snd_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 	case SNDRV_CTL_IOCTL_SUBSCRIBE_EVENTS:
 		return snd_ctl_subscribe_events(ctl, ip);
 	case SNDRV_CTL_IOCTL_TLV_READ:
-		return snd_ctl_tlv_ioctl(ctl, argp, 0);
+		return snd_ctl_tlv_ioctl(ctl, argp, SNDRV_CTL_TLV_OP_READ);
 	case SNDRV_CTL_IOCTL_TLV_WRITE:
-		return snd_ctl_tlv_ioctl(ctl, argp, 1);
+		return snd_ctl_tlv_ioctl(ctl, argp, SNDRV_CTL_TLV_OP_WRITE);
 	case SNDRV_CTL_IOCTL_TLV_COMMAND:
-		return snd_ctl_tlv_ioctl(ctl, argp, -1);
+		return snd_ctl_tlv_ioctl(ctl, argp, SNDRV_CTL_TLV_OP_CMD);
 	case SNDRV_CTL_IOCTL_POWER:
 		return -ENOPROTOOPT;
 	case SNDRV_CTL_IOCTL_POWER_STATE:
@@ -1438,7 +1435,7 @@ static long snd_ctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		}
 	}
 	up_read(&snd_ioctl_rwsem);
-	snd_printdd("unknown ioctl = 0x%x\n", cmd);
+	dev_dbg(card->dev, "unknown ioctl = 0x%x\n", cmd);
 	return -ENOTTY;
 }
 

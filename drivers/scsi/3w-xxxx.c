@@ -216,6 +216,7 @@
 #include <scsi/scsi_host.h>
 #include <scsi/scsi_tcq.h>
 #include <scsi/scsi_cmnd.h>
+#include <scsi/scsi_eh.h>
 #include "3w-xxxx.h"
 
 /* Globals */
@@ -1045,6 +1046,9 @@ static int tw_chrdev_open(struct inode *inode, struct file *file)
 	unsigned int minor_number;
 
 	dprintk(KERN_WARNING "3w-xxxx: tw_ioctl_open()\n");
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EACCES;
 
 	minor_number = iminor(inode);
 	if (minor_number >= tw_device_extension_count)
@@ -1980,7 +1984,8 @@ static int tw_scsi_queue_lck(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_c
 			printk(KERN_NOTICE "3w-xxxx: scsi%d: Unknown scsi opcode: 0x%x\n", tw_dev->host->host_no, *command);
 			tw_dev->state[request_id] = TW_S_COMPLETED;
 			tw_state_request_finish(tw_dev, request_id);
-			SCpnt->result = (DID_BAD_TARGET << 16);
+			SCpnt->result = (DRIVER_SENSE << 24) | SAM_STAT_CHECK_CONDITION;
+			scsi_build_sense_buffer(1, SCpnt->sense_buffer, ILLEGAL_REQUEST, 0x20, 0);
 			done(SCpnt);
 			retval = 0;
 	}

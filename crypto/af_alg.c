@@ -211,17 +211,8 @@ static int alg_setkey(struct sock *sk, char __user *ukey,
 		return -ENOMEM;
 
 	err = -EFAULT;
-	
-	if (keylen == 1)
-	{
-		/* for MTP or register key setting */
-		*key = (int)ukey;
-	}
-	else
-	{
-		if (copy_from_user(key, ukey, keylen))
-			goto out;
-	}
+	if (copy_from_user(key, ukey, keylen))
+		goto out;
 
 	err = type->setkey(ask->private, key, keylen);
 
@@ -251,47 +242,12 @@ static int alg_setsockopt(struct socket *sock, int level, int optname,
 
 	switch (optname) {
 	case ALG_SET_KEY:
-	case ALG_MTP_PROGRAM:
 		if (sock->state == SS_CONNECTED)
 			goto unlock;
 		if (!type->setkey)
 			goto unlock;
 
 		err = alg_setkey(sk, optval, optlen);
-		break;
-		
-	case ALG_USE_REG_KEY:
-		if (sock->state == SS_CONNECTED)
-			goto unlock;
-		if (!type->setkey)
-			goto unlock;
-
-		err = alg_setkey(sk, 0, 1);
-		break;
-
-	case ALG_USE_MTP_KEY:
-		if (sock->state == SS_CONNECTED)
-			goto unlock;
-		if (!type->setkey)
-			goto unlock;
-		err = alg_setkey(sk, 1, 1);
-		break;
-
-	case ALG_MTP_LOCK:
-		if (sock->state == SS_CONNECTED)
-			goto unlock;
-		if (!type->setkey)
-			goto unlock;
-		err = alg_setkey(sk, 0, 0);
-		break;
-
-	case ALG_MTP_STATUS:
-		if (sock->state == SS_CONNECTED)
-			goto unlock;
-		if (!type->setkey)
-			goto unlock;
-		err = alg_setkey(sk, 0, 1);
-		break;
 	}
 
 unlock:
@@ -523,7 +479,7 @@ int af_alg_wait_for_completion(int err, struct af_alg_completion *completion)
 	case -EINPROGRESS:
 	case -EBUSY:
 		wait_for_completion(&completion->completion);
-		INIT_COMPLETION(completion->completion);
+		reinit_completion(&completion->completion);
 		err = completion->err;
 		break;
 	};

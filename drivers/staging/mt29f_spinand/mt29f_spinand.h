@@ -58,13 +58,6 @@
 #define STATUS_ECC_ERROR		(2 << 4)
 #define STATUS_ECC_RESERVED		(3 << 4)
 
-#define STATUS_ECC_MASK_GIGA		0x70
-#define STATUS_ECC_ERROR_GIGA		0x70
-#define STATUS_ECC_MASK_MACRONIX	0x30
-#define STATUS_ECC_ERROR_MACRONIX	0x20
-#define SPINAND_ECC_ERROR		0x1
-#define SPINAND_ECC_CORRECTED		0x2
-
 /*ECC enable defines*/
 #define OTP_ECC_MASK			0x10
 #define OTP_ECC_OFF			0
@@ -84,9 +77,18 @@
 #define BL_1_64_LOCKED     0x08
 #define BL_ALL_UNLOCKED    0
 
-/* wb multi die */
-#define WB_MULTI_DIESELECT      0xC2
+struct spinand_info {
+	struct nand_ecclayout *ecclayout;
+	struct spi_device *spi;
+	void *priv;
+};
 
+struct spinand_state {
+	uint32_t	col;
+	uint32_t	row;
+	int		buf_ptr;
+	u8		*buf;
+};
 
 struct spinand_cmd {
 	u8		cmd;
@@ -97,36 +99,6 @@ struct spinand_cmd {
 	u8		*tx_buf;	/* Tx buf */
 	u32		n_rx;		/* Number of rx bytes */
 	u8		*rx_buf;	/* Rx buf */
-};
-
-struct spinand_ops {
-	u8   maf_id;
-	u16   dev_id;
-	void (*spinand_set_defaults)(struct spi_device *spi_nand);
-	void (*spinand_read_cmd)(struct spinand_cmd *cmd, u32 page_id);
-	void (*spinand_read_data)(struct spinand_cmd *cmd, u16 column,
-							u32 page_id);
-	void (*spinand_write_cmd)(struct spinand_cmd *cmd, u32 page_id);
-	void (*spinand_write_data)(struct spinand_cmd *cmd, u16 column,
-							u32 page_id);
-	void (*spinand_erase_blk)(struct spinand_cmd *cmd, u32 page_id);
-	int (*spinand_parse_id)(struct spi_device *spi_nand, u8 *nand_id,
-								u8 *id);
-	int (*spinand_verify_ecc)(u8 status);
-};
-
-struct spinand_info {
-	struct nand_ecclayout *ecclayout;
-	struct spi_device *spi;
-	void *priv;
-	struct spinand_ops *dev_ops;
-};
-
-struct spinand_state {
-	uint32_t	col;
-	uint32_t	row;
-	int		buf_ptr;
-	u8		*buf;
 };
 
 extern int spinand_mtd(struct mtd_info *mtd);

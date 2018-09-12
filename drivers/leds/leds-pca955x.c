@@ -267,7 +267,7 @@ static int pca955x_probe(struct i2c_client *client,
 
 	chip = &pca955x_chipdefs[id->driver_data];
 	adapter = to_i2c_adapter(client->dev.parent);
-	pdata = client->dev.platform_data;
+	pdata = dev_get_platdata(&client->dev);
 
 	/* Make sure the slave address / chip type combo given is possible */
 	if ((client->addr & ~((1 << chip->slv_addr_shift) - 1)) !=
@@ -281,7 +281,7 @@ static int pca955x_probe(struct i2c_client *client,
 			"slave address 0x%02x\n",
 			id->name, chip->bits, client->addr);
 
-	if (!i2c_check_functionality(adapter, I2C_FUNC_I2C))
+	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA))
 		return -EIO;
 
 	if (pdata) {

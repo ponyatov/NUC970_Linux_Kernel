@@ -263,7 +263,7 @@ static int copy_ctl_value_from_user(struct snd_card *card,
 	} else {
 		size = get_elem_size(type, count);
 		if (size < 0) {
-			printk(KERN_ERR "snd_ioctl32_ctl_elem_value: unknown type %d\n", type);
+			dev_err(card->dev, "snd_ioctl32_ctl_elem_value: unknown type %d\n", type);
 			return -EINVAL;
 		}
 		if (copy_from_user(data->value.bytes.data, valuep, size))
@@ -400,8 +400,7 @@ static int snd_ctl_elem_add_compat(struct snd_ctl_file *file,
 	if (copy_from_user(&data->id, &data32->id, sizeof(data->id)) ||
 	    copy_from_user(&data->type, &data32->type, 3 * sizeof(u32)))
 		goto error;
-	if (get_user(data->owner, &data32->owner) ||
-	    get_user(data->type, &data32->type))
+	if (get_user(data->owner, &data32->owner))
 		goto error;
 	switch (data->type) {
 	case SNDRV_CTL_ELEM_TYPE_BOOLEAN:

@@ -62,6 +62,7 @@ void
 intel_i2c_reset(struct drm_device *dev)
 {
 	struct drm_i915_private *dev_priv = dev->dev_private;
+
 	I915_WRITE(dev_priv->gpio_mmio_base + GMBUS0, 0);
 	I915_WRITE(dev_priv->gpio_mmio_base + GMBUS4, 0);
 }
@@ -203,13 +204,6 @@ intel_gpio_setup(struct intel_gmbus *bus, u32 pin)
 	algo->data = bus;
 }
 
-/*
- * gmbus on gen4 seems to be able to generate legacy interrupts even when in MSI
- * mode. This results in spurious interrupt warnings if the legacy irq no. is
- * shared with another device. The kernel then disables that interrupt source
- * and so prevents the other device from working properly.
- */
-#define HAS_GMBUS_IRQ(dev) (INTEL_INFO(dev)->gen >= 5)
 static int
 gmbus_wait_hw_status(struct drm_i915_private *dev_priv,
 		     u32 gmbus2_status,
@@ -400,7 +394,9 @@ static bool
 gmbus_is_index_read(struct i2c_msg *msgs, int i, int num)
 {
 	return (i + 1 < num &&
-		!(msgs[i].flags & I2C_M_RD) && msgs[i].len <= 2 &&
+		msgs[i].addr == msgs[i + 1].addr &&
+		!(msgs[i].flags & I2C_M_RD) &&
+		(msgs[i].len == 1 || msgs[i].len == 2) &&
 		(msgs[i + 1].flags & I2C_M_RD));
 }
 
@@ -444,6 +440,7 @@ gmbus_xfer(struct i2c_adapter *adapter,
 	int i = 0, inc, try = 0, reg_offset;
 	int ret = 0;
 
+	intel_aux_display_runtime_get(dev_priv);
 	mutex_lock(&dev_priv->gmbus_mutex);
 
 	if (bus->force_bit) {
@@ -557,6 +554,7 @@ timeout:
 
 out:
 	mutex_unlock(&dev_priv->gmbus_mutex);
+	intel_aux_display_runtime_put(dev_priv);
 	return ret;
 }
 

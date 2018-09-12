@@ -46,6 +46,23 @@
 void (*pm_power_off)(void) = machine_power_off;
 EXPORT_SYMBOL(pm_power_off);
 
+#ifdef CONFIG_ALPHA_WTINT
+/*
+ * Sleep the CPU.
+ * EV6, LCA45 and QEMU know how to power down, skipping N timer interrupts.
+ */
+void arch_cpu_idle(void)
+{
+	wtint(0);
+	local_irq_enable();
+}
+
+void arch_cpu_idle_dead(void)
+{
+	wtint(INT_MAX);
+}
+#endif /* ALPHA_WTINT */
+
 struct halt_info {
 	int mode;
 	char *restart_cmd;
@@ -117,7 +134,9 @@ common_shutdown_1(void *generic_ptr)
 		if (in_interrupt())
 			irq_exit();
 		/* This has the effect of resetting the VGA video origin.  */
-		take_over_console(&dummy_con, 0, MAX_NR_CONSOLES-1, 1);
+		console_lock();
+		do_take_over_console(&dummy_con, 0, MAX_NR_CONSOLES-1, 1);
+		console_unlock();
 #endif
 		pci_restore_srm_config();
 		set_hae(srm_hae);
@@ -255,12 +274,13 @@ copy_thread(unsigned long clone_flags, unsigned long usp,
 	   application calling fork.  */
 	if (clone_flags & CLONE_SETTLS)
 		childti->pcb.unique = regs->r20;
+	else
+		regs->r20 = 0;	/* OSF/1 has some strange fork() semantics.  */
 	childti->pcb.usp = usp ?: rdusp();
 	*childregs = *regs;
 	childregs->r0 = 0;
 	childregs->r19 = 0;
 	childregs->r20 = 1;	/* OSF/1 has some strange fork() semantics.  */
-	regs->r20 = 0;
 	stack = ((struct switch_stack *) regs) - 1;
 	*childstack = *stack;
 	childstack->r26 = (unsigned long) ret_from_fork;

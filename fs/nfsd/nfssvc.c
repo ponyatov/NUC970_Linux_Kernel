@@ -116,7 +116,10 @@ struct svc_program		nfsd_program = {
 
 };
 
-u32 nfsd_supported_minorversion;
+static bool nfsd_supported_minorversions[NFSD_SUPPORTED_MINOR_VERSION + 1] = {
+	[0] = 1,
+	[1] = 1,
+};
 
 int nfsd_vers(int vers, enum vers_op change)
 {
@@ -147,19 +150,18 @@ int nfsd_vers(int vers, enum vers_op change)
 
 int nfsd_minorversion(u32 minorversion, enum vers_op change)
 {
-	if (minorversion > NFSD_SUPPORTED_MINOR_VERSION)
+	if (minorversion > NFSD_SUPPORTED_MINOR_VERSION &&
+	    change != NFSD_AVAIL)
 		return -1;
 	switch(change) {
 	case NFSD_SET:
-		nfsd_supported_minorversion = minorversion;
+		nfsd_supported_minorversions[minorversion] = true;
 		break;
 	case NFSD_CLEAR:
-		if (minorversion == 0)
-			return -1;
-		nfsd_supported_minorversion = minorversion - 1;
+		nfsd_supported_minorversions[minorversion] = false;
 		break;
 	case NFSD_TEST:
-		return minorversion <= nfsd_supported_minorversion;
+		return nfsd_supported_minorversions[minorversion];
 	case NFSD_AVAIL:
 		return minorversion <= NFSD_SUPPORTED_MINOR_VERSION;
 	}
@@ -243,6 +245,15 @@ static void nfsd_shutdown_generic(void)
 	nfsd_racache_shutdown();
 }
 
+static bool nfsd_needs_lockd(void)
+{
+#if defined(CONFIG_NFSD_V3)
+	return (nfsd_versions[2] != NULL) || (nfsd_versions[3] != NULL);
+#else
+	return (nfsd_versions[2] != NULL);
+#endif
+}
+
 static int nfsd_startup_net(int nrservs, struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
@@ -257,9 +268,14 @@ static int nfsd_startup_net(int nrservs, struct net *net)
 	ret = nfsd_init_socks(net);
 	if (ret)
 		goto out_socks;
-	ret = lockd_up(net);
-	if (ret)
-		goto out_socks;
+
+	if (nfsd_needs_lockd() && !nn->lockd_up) {
+		ret = lockd_up(net);
+		if (ret)
+			goto out_socks;
+		nn->lockd_up = 1;
+	}
+
 	ret = nfs4_state_start_net(net);
 	if (ret)
 		goto out_lockd;
@@ -268,7 +284,10 @@ static int nfsd_startup_net(int nrservs, struct net *net)
 	return 0;
 
 out_lockd:
-	lockd_down(net);
+	if (nn->lockd_up) {
+		lockd_down(net);
+		nn->lockd_up = 0;
+	}
 out_socks:
 	nfsd_shutdown_generic();
 	return ret;
@@ -279,7 +298,10 @@ static void nfsd_shutdown_net(struct net *net)
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
 	nfs4_state_shutdown_net(net);
-	lockd_down(net);
+	if (nn->lockd_up) {
+		lockd_down(net);
+		nn->lockd_up = 0;
+	}
 	nn->nfsd_net_up = false;
 	nfsd_shutdown_generic();
 }
@@ -307,23 +329,20 @@ static void nfsd_last_thread(struct svc_serv *serv, struct net *net)
 
 void nfsd_reset_versions(void)
 {
-	int found_one = 0;
 	int i;
 
-	for (i = NFSD_MINVERS; i < NFSD_NRVERS; i++) {
-		if (nfsd_program.pg_vers[i])
-			found_one = 1;
-	}
+	for (i = 0; i < NFSD_NRVERS; i++)
+		if (nfsd_vers(i, NFSD_TEST))
+			return;
 
-	if (!found_one) {
-		for (i = NFSD_MINVERS; i < NFSD_NRVERS; i++)
-			nfsd_program.pg_vers[i] = nfsd_version[i];
-#if defined(CONFIG_NFSD_V2_ACL) || defined(CONFIG_NFSD_V3_ACL)
-		for (i = NFSD_ACL_MINVERS; i < NFSD_ACL_NRVERS; i++)
-			nfsd_acl_program.pg_vers[i] =
-				nfsd_acl_version[i];
-#endif
-	}
+	for (i = 0; i < NFSD_NRVERS; i++)
+		if (i != 4)
+			nfsd_vers(i, NFSD_SET);
+		else {
+			int minor = 0;
+			while (nfsd_minorversion(minor, NFSD_SET) >= 0)
+				minor++;
+		}
 }
 
 /*
@@ -387,6 +406,7 @@ int nfsd_create_serv(struct net *net)
 	if (nn->nfsd_serv == NULL)
 		return -ENOMEM;
 
+	nn->nfsd_serv->sv_maxconn = nn->max_connections;
 	error = svc_bind(nn->nfsd_serv, net);
 	if (error < 0) {
 		svc_destroy(nn->nfsd_serv);
@@ -451,8 +471,7 @@ int nfsd_set_nrthreads(int n, int *nthreads, struct net *net)
 	/* enforce a global maximum number of threads */
 	tot = 0;
 	for (i = 0; i < n; i++) {
-		if (nthreads[i] > NFSD_MAXSERVS)
-			nthreads[i] = NFSD_MAXSERVS;
+		nthreads[i] = min(nthreads[i], NFSD_MAXSERVS);
 		tot += nthreads[i];
 	}
 	if (tot > NFSD_MAXSERVS) {
@@ -501,11 +520,11 @@ nfsd_svc(int nrservs, struct net *net)
 
 	mutex_lock(&nfsd_mutex);
 	dprintk("nfsd: creating service\n");
-	if (nrservs <= 0)
-		nrservs = 0;
-	if (nrservs > NFSD_MAXSERVS)
-		nrservs = NFSD_MAXSERVS;
+
+	nrservs = max(nrservs, 0);
+	nrservs = min(nrservs, NFSD_MAXSERVS);
 	error = 0;
+
 	if (nrservs == 0 && nn->nfsd_serv == NULL)
 		goto out;
 
@@ -546,6 +565,7 @@ nfsd(void *vrqstp)
 	struct svc_rqst *rqstp = (struct svc_rqst *) vrqstp;
 	struct svc_xprt *perm_sock = list_entry(rqstp->rq_server->sv_permsocks.next, typeof(struct svc_xprt), xpt_list);
 	struct net *net = perm_sock->xpt_net;
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 	int err;
 
 	/* Lock module and set up kernel thread */
@@ -573,18 +593,15 @@ nfsd(void *vrqstp)
 	nfsdstats.th_cnt++;
 	mutex_unlock(&nfsd_mutex);
 
-	/*
-	 * We want less throttling in balance_dirty_pages() so that nfs to
-	 * localhost doesn't cause nfsd to lock up due to all the client's
-	 * dirty pages.
-	 */
-	current->flags |= PF_LESS_THROTTLE;
 	set_freezable();
 
 	/*
 	 * The main request loop
 	 */
 	for (;;) {
+		/* Update sv_maxconn if it has changed */
+		rqstp->rq_server->sv_maxconn = nn->max_connections;
+
 		/*
 		 * Find a socket with data available and call its
 		 * recvfrom routine.

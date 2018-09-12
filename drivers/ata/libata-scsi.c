@@ -49,7 +49,6 @@
 #include <linux/hdreg.h>
 #include <linux/uaccess.h>
 #include <linux/suspend.h>
-#include <linux/pm_qos.h>
 #include <asm/unaligned.h>
 
 #include "libata.h"
@@ -218,8 +217,10 @@ static ssize_t ata_scsi_park_store(struct device *device,
 	unsigned long flags;
 	int rc;
 
-	rc = strict_strtol(buf, 10, &input);
-	if (rc || input < -2)
+	rc = kstrtol(buf, 10, &input);
+	if (rc)
+		return rc;
+	if (input < -2)
 		return -EINVAL;
 	if (input > ATA_TMOUT_MAX_PARK) {
 		rc = -EOVERFLOW;
@@ -860,25 +861,24 @@ static void ata_to_sense_error(unsigned id, u8 drv_stat, u8 drv_err, u8 *sk,
 		/*  Bad address mark */
 		{0x01, 		MEDIUM_ERROR, 0x13, 0x00}, 	// Address mark not found       Address mark not found for data field
 		/* TRK0 */
-		{0x02, 		HARDWARE_ERROR, 0x00, 0x00}, 	// Track 0 not found		  Hardware error
-		/* Abort & !ICRC */
-		{0x04, 		ABORTED_COMMAND, 0x00, 0x00}, 	// Aborted command              Aborted command
+		{0x02, 		HARDWARE_ERROR, 0x00, 0x00}, 	// Track 0 not found		Hardware error
+		/* Abort: 0x04 is not translated here, see below */
 		/* Media change request */
 		{0x08, 		NOT_READY, 0x04, 0x00}, 	// Media change request	  FIXME: faking offline
-		/* SRV */
-		{0x10, 		ABORTED_COMMAND, 0x14, 0x00}, 	// ID not found                 Recorded entity not found
-		/* Media change */
-		{0x08,  	NOT_READY, 0x04, 0x00}, 	// Media change		  FIXME: faking offline
+		/* SRV/IDNF */
+		{0x10, 		ILLEGAL_REQUEST, 0x21, 0x00}, 	// ID not found                 Logical address out of range
+		/* MC */
+		{0x20, 		UNIT_ATTENTION, 0x28, 0x00}, 	// Media Changed		Not ready to ready change, medium may have changed
 		/* ECC */
 		{0x40, 		MEDIUM_ERROR, 0x11, 0x04}, 	// Uncorrectable ECC error      Unrecovered read error
 		/* BBD - block marked bad */
-		{0x80, 		MEDIUM_ERROR, 0x11, 0x04}, 	// Block marked bad		  Medium error, unrecovered read error
+		{0x80, 		MEDIUM_ERROR, 0x11, 0x04}, 	// Block marked bad		Medium error, unrecovered read error
 		{0xFF, 0xFF, 0xFF, 0xFF}, // END mark
 	};
 	static const unsigned char stat_table[][4] = {
 		/* Must be first because BUSY means no other bits valid */
 		{0x80, 		ABORTED_COMMAND, 0x47, 0x00},	// Busy, fake parity for now
-		{0x20, 		HARDWARE_ERROR,  0x00, 0x00}, 	// Device fault
+		{0x20, 		HARDWARE_ERROR,  0x44, 0x00}, 	// Device fault, internal target failure
 		{0x08, 		ABORTED_COMMAND, 0x47, 0x00},	// Timed out in xfer, fake parity for now
 		{0x04, 		RECOVERED_ERROR, 0x11, 0x00},	// Recovered ECC error	  Medium error, recovered
 		{0xFF, 0xFF, 0xFF, 0xFF}, // END mark
@@ -903,13 +903,13 @@ static void ata_to_sense_error(unsigned id, u8 drv_stat, u8 drv_err, u8 *sk,
 				goto translate_done;
 			}
 		}
-		/* No immediate match */
-		if (verbose)
-			printk(KERN_WARNING "ata%u: no sense translation for "
-			       "error 0x%02x\n", id, drv_err);
 	}
 
-	/* Fall back to interpreting status bits */
+	/*
+	 * Fall back to interpreting status bits.  Note that if the drv_err
+	 * has only the ABRT bit set, we decode drv_stat.  ABRT by itself
+	 * is not descriptive enough.
+	 */
 	for (i = 0; stat_table[i][0] != 0xFF; i++) {
 		if (stat_table[i][0] & drv_stat) {
 			*sk = stat_table[i][1];
@@ -918,13 +918,11 @@ static void ata_to_sense_error(unsigned id, u8 drv_stat, u8 drv_err, u8 *sk,
 			goto translate_done;
 		}
 	}
-	/* No error?  Undecoded? */
-	if (verbose)
-		printk(KERN_WARNING "ata%u: no sense translation for "
-		       "status: 0x%02x\n", id, drv_stat);
 
-	/* We need a sensible error return here, which is tricky, and one
-	   that won't cause people to do things like return a disk wrongly */
+	/*
+	 * We need a sensible error return here, which is tricky, and one
+	 * that won't cause people to do things like return a disk wrongly.
+	 */
 	*sk = ABORTED_COMMAND;
 	*asc = 0x00;
 	*ascq = 0x00;
@@ -1994,7 +1992,11 @@ static unsigned int ata_scsiop_inq_std(struct ata_scsi_args *args, u8 *rbuf)
 	memcpy(rbuf, hdr, sizeof(hdr));
 	memcpy(&rbuf[8], "ATA     ", 8);
 	ata_id_string(args->id, &rbuf[16], ATA_ID_PROD, 16);
-	ata_id_string(args->id, &rbuf[32], ATA_ID_FW_REV, 4);
+
+	/* From SAT, use last 2 words from fw rev unless they are spaces */
+	ata_id_string(args->id, &rbuf[32], ATA_ID_FW_REV + 2, 4);
+	if (strncmp(&rbuf[32], "    ", 4) == 0)
+		ata_id_string(args->id, &rbuf[32], ATA_ID_FW_REV, 4);
 
 	if (rbuf[32] == 0 || rbuf[32] == ' ')
 		memcpy(&rbuf[32], "n/a ", 4);
@@ -2513,13 +2515,15 @@ static unsigned int ata_scsiop_read_cap(struct ata_scsi_args *args, u8 *rbuf)
 
 		if (ata_id_has_trim(args->id) &&
 		    !(dev->horkage & ATA_HORKAGE_NOTRIM)) {
-			rbuf[14] |= 0x80; /* TPE */
+			rbuf[14] |= 0x80; /* LBPME */
 
-			if (ata_id_has_zero_after_trim(args->id))
-				rbuf[14] |= 0x40; /* TPRZ */
+			if (ata_id_has_zero_after_trim(args->id) &&
+			    dev->horkage & ATA_HORKAGE_ZERO_AFTER_TRIM) {
+				ata_dev_info(dev, "Enabling discard_zeroes_data\n");
+				rbuf[14] |= 0x40; /* LBPRZ */
+			}
 		}
 	}
-
 	return 0;
 }
 
@@ -3115,12 +3119,25 @@ static unsigned int ata_scsi_write_same_xlat(struct ata_queued_cmd *qc)
 	buf = page_address(sg_page(scsi_sglist(scmd)));
 	size = ata_set_lba_range_entries(buf, 512, block, n_block);
 
-	tf->protocol = ATA_PROT_DMA;
-	tf->hob_feature = 0;
-	tf->feature = ATA_DSM_TRIM;
-	tf->hob_nsect = (size / 512) >> 8;
-	tf->nsect = size / 512;
-	tf->command = ATA_CMD_DSM;
+	if (ata_ncq_enabled(dev) && ata_fpdma_dsm_supported(dev)) {
+		/* Newer devices support queued TRIM commands */
+		tf->protocol = ATA_PROT_NCQ;
+		tf->command = ATA_CMD_FPDMA_SEND;
+		tf->hob_nsect = ATA_SUBCMD_FPDMA_SEND_DSM & 0x1f;
+		tf->nsect = qc->tag << 3;
+		tf->hob_feature = (size / 512) >> 8;
+		tf->feature = size / 512;
+
+		tf->auxiliary = 1;
+	} else {
+		tf->protocol = ATA_PROT_DMA;
+		tf->hob_feature = 0;
+		tf->feature = ATA_DSM_TRIM;
+		tf->hob_nsect = (size / 512) >> 8;
+		tf->nsect = size / 512;
+		tf->command = ATA_CMD_DSM;
+	}
+
 	tf->flags |= ATA_TFLAG_ISADDR | ATA_TFLAG_DEVICE | ATA_TFLAG_LBA48 |
 		     ATA_TFLAG_WRITE;
 
@@ -3412,7 +3429,9 @@ static inline int __ata_scsi_queuecmd(struct scsi_cmnd *scmd,
 		if (likely((scsi_op != ATA_16) || !atapi_passthru16)) {
 			/* relay SCSI command to ATAPI device */
 			int len = COMMAND_SIZE(scsi_op);
-			if (unlikely(len > scmd->cmd_len || len > dev->cdb_len))
+			if (unlikely(len > scmd->cmd_len ||
+				     len > dev->cdb_len ||
+				     scmd->cmd_len > ATAPI_CDB_LEN))
 				goto bad_cdb_len;
 
 			xlat_func = atapi_xlat;
@@ -3683,9 +3702,6 @@ void ata_scsi_scan_host(struct ata_port *ap, int sync)
 			if (!IS_ERR(sdev)) {
 				dev->sdev = sdev;
 				scsi_device_put(sdev);
-				if (zpodd_dev_enabled(dev))
-					dev_pm_qos_expose_flags(
-							&sdev->sdev_gendev, 0);
 			} else {
 				dev->sdev = NULL;
 			}
@@ -3782,9 +3798,6 @@ static void ata_scsi_remove_dev(struct ata_device *dev)
 	mutex_lock(&ap->scsi_host->scan_mutex);
 	spin_lock_irqsave(ap->lock, flags);
 
-	if (zpodd_dev_enabled(dev))
-		zpodd_exit(dev);
-
 	/* clearing dev->sdev is protected by host lock */
 	sdev = dev->sdev;
 	dev->sdev = NULL;
@@ -3833,6 +3846,9 @@ static void ata_scsi_handle_link_detach(struct ata_link *link)
 		spin_lock_irqsave(ap->lock, flags);
 		dev->flags &= ~ATA_DFLAG_DETACHED;
 		spin_unlock_irqrestore(ap->lock, flags);
+
+		if (zpodd_dev_enabled(dev))
+			zpodd_exit(dev);
 
 		ata_scsi_remove_dev(dev);
 	}
@@ -3935,7 +3951,7 @@ void ata_scsi_hotplug(struct work_struct *work)
  *	Zero.
  */
 int ata_scsi_user_scan(struct Scsi_Host *shost, unsigned int channel,
-		       unsigned int id, unsigned int lun)
+		       unsigned int id, u64 lun)
 {
 	struct ata_port *ap = ata_shost_to_port(shost);
 	unsigned long flags;

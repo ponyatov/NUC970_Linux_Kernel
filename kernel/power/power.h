@@ -2,6 +2,7 @@
 #include <linux/suspend_ioctls.h>
 #include <linux/utsname.h>
 #include <linux/freezer.h>
+#include <linux/compiler.h>
 
 struct swsusp_info {
 	struct new_utsname	uts;
@@ -11,7 +12,7 @@ struct swsusp_info {
 	unsigned long		image_pages;
 	unsigned long		pages;
 	unsigned long		size;
-} __attribute__((aligned(PAGE_SIZE)));
+} __aligned(PAGE_SIZE);
 
 #ifdef CONFIG_HIBERNATION
 /* kernel/power/snapshot.c */
@@ -49,6 +50,8 @@ static inline char *check_image_kernel(struct swsusp_info *info)
  */
 #define SPARE_PAGES	((1024 * 1024) >> PAGE_SHIFT)
 
+asmlinkage int swsusp_save(void);
+
 /* kernel/power/hibernate.c */
 extern bool freezer_test_done;
 
@@ -81,9 +84,6 @@ extern unsigned long reserved_size;
 extern int in_suspend;
 extern dev_t swsusp_resume_device;
 extern sector_t swsusp_resume_block;
-
-extern asmlinkage int swsusp_arch_suspend(void);
-extern asmlinkage int swsusp_arch_resume(void);
 
 extern int create_basic_memory_bitmaps(void);
 extern void free_basic_memory_bitmaps(void);
@@ -175,13 +175,9 @@ extern void swsusp_show_speed(struct timeval *, struct timeval *,
 				unsigned int, char *);
 
 #ifdef CONFIG_SUSPEND
-struct pm_sleep_state {
-	const char *label;
-	suspend_state_t state;
-};
-
 /* kernel/power/suspend.c */
-extern struct pm_sleep_state pm_states[];
+extern const char *pm_labels[];
+extern const char *pm_states[];
 
 extern int suspend_devices_and_enter(suspend_state_t state);
 #else /* !CONFIG_SUSPEND */

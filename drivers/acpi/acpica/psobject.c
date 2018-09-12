@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2013, Intel Corp.
+ * Copyright (C) 2000 - 2014, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -118,6 +118,9 @@ static acpi_status acpi_ps_get_aml_opcode(struct acpi_walk_state *walk_state)
 			     (u32)(walk_state->aml_offset +
 				   sizeof(struct acpi_table_header)));
 
+			ACPI_ERROR((AE_INFO,
+				    "Aborting disassembly, AML byte code is corrupt"));
+
 			/* Dump the context surrounding the invalid opcode */
 
 			acpi_ut_dump_buffer(((u8 *)walk_state->parser_state.
@@ -126,6 +129,14 @@ static acpi_status acpi_ps_get_aml_opcode(struct acpi_walk_state *walk_state)
 					     sizeof(struct acpi_table_header) -
 					     16));
 			acpi_os_printf(" */\n");
+
+			/*
+			 * Just abort the disassembly, cannot continue because the
+			 * parser is essentially lost. The disassembler can then
+			 * randomly fail because an ill-constructed parse tree
+			 * can result.
+			 */
+			return_ACPI_STATUS(AE_AML_BAD_OPCODE);
 #endif
 		}
 
@@ -219,7 +230,10 @@ acpi_ps_build_named_op(struct acpi_walk_state *walk_state,
 
 	status = walk_state->descending_callback(walk_state, op);
 	if (ACPI_FAILURE(status)) {
-		ACPI_EXCEPTION((AE_INFO, status, "During name lookup/catalog"));
+		if (status != AE_CTRL_TERMINATE) {
+			ACPI_EXCEPTION((AE_INFO, status,
+					"During name lookup/catalog"));
+		}
 		return_ACPI_STATUS(status);
 	}
 
@@ -230,7 +244,7 @@ acpi_ps_build_named_op(struct acpi_walk_state *walk_state,
 	status = acpi_ps_next_parse_state(walk_state, *op, status);
 	if (ACPI_FAILURE(status)) {
 		if (status == AE_CTRL_PENDING) {
-			return_ACPI_STATUS(AE_CTRL_PARSE_PENDING);
+			status = AE_CTRL_PARSE_PENDING;
 		}
 		return_ACPI_STATUS(status);
 	}
@@ -286,6 +300,9 @@ acpi_ps_create_op(struct acpi_walk_state *walk_state,
 	status = acpi_ps_get_aml_opcode(walk_state);
 	if (status == AE_CTRL_PARSE_CONTINUE) {
 		return_ACPI_STATUS(AE_CTRL_PARSE_CONTINUE);
+	}
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
 	}
 
 	/* Create Op structure and append to parent's argument list */
@@ -402,6 +419,7 @@ acpi_ps_complete_op(struct acpi_walk_state *walk_state,
 
 	switch (status) {
 	case AE_OK:
+
 		break;
 
 	case AE_CTRL_TRANSFER:

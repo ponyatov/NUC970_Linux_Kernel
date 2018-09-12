@@ -35,7 +35,7 @@ typedef __kernel_gid16_t        gid16_t;
 
 typedef unsigned long		uintptr_t;
 
-#ifdef CONFIG_HAVE_UID16
+#ifdef CONFIG_UID16
 /* This is defined by include/asm-{arch}/posix_types.h */
 typedef __kernel_old_uid_t	old_uid_t;
 typedef __kernel_old_gid_t	old_gid_t;
@@ -142,6 +142,7 @@ typedef unsigned long blkcnt_t;
 #define pgoff_t unsigned long
 #endif
 
+/* A dma_addr_t can hold any valid DMA or bus address for the platform */
 #ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
 typedef u64 dma_addr_t;
 #else

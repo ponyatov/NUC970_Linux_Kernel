@@ -7,7 +7,7 @@
  *
  * Written Doug Thompson <norsk5@xmission.com> www.softwarebitmaker.com
  *
- * (c) 2012-2013 - Mauro Carvalho Chehab <mchehab@redhat.com>
+ * (c) 2012-2013 - Mauro Carvalho Chehab
  *	The entire API were re-written, and ported to use struct device
  *
  */
@@ -108,7 +108,9 @@ static const char * const mem_types[] = {
 	[MEM_RDDR2] = "Registered-DDR2",
 	[MEM_XDR] = "XDR",
 	[MEM_DDR3] = "Unbuffered-DDR3",
-	[MEM_RDDR3] = "Registered-DDR3"
+	[MEM_RDDR3] = "Registered-DDR3",
+	[MEM_DDR4] = "Unbuffered-DDR4",
+	[MEM_RDDR4] = "Registered-DDR4"
 };
 
 static const char * const dev_types[] = {
@@ -682,7 +684,7 @@ static ssize_t mci_sdram_scrub_rate_store(struct device *dev,
 	unsigned long bandwidth = 0;
 	int new_bw = 0;
 
-	if (strict_strtoul(data, 10, &bandwidth) < 0)
+	if (kstrtoul(data, 10, &bandwidth) < 0)
 		return -EINVAL;
 
 	new_bw = mci->set_sdram_scrub_rate(mci, bandwidth);
@@ -916,7 +918,7 @@ void __exit edac_debugfs_exit(void)
 	debugfs_remove(edac_debugfs);
 }
 
-int edac_create_debug_nodes(struct mem_ctl_info *mci)
+static int edac_create_debug_nodes(struct mem_ctl_info *mci)
 {
 	struct dentry *d, *parent;
 	char name[80];
@@ -973,26 +975,21 @@ nomem:
  */
 int edac_create_sysfs_mci_device(struct mem_ctl_info *mci)
 {
-	char *name;
 	int i, err;
 
 	/*
 	 * The memory controller needs its own bus, in order to avoid
 	 * namespace conflicts at /sys/bus/edac.
 	 */
-	name = kasprintf(GFP_KERNEL, "mc%d", mci->mc_idx);
-	if (!name)
+	mci->bus->name = kasprintf(GFP_KERNEL, "mc%d", mci->mc_idx);
+	if (!mci->bus->name)
 		return -ENOMEM;
-
-	mci->bus->name = name;
 
 	edac_dbg(0, "creating bus %s\n", mci->bus->name);
 
 	err = bus_register(mci->bus);
-	if (err < 0) {
-		kfree(name);
+	if (err < 0)
 		return err;
-	}
 
 	/* get the /sys/devices/system/edac subsys reference */
 	mci->dev.type = &mci_attr_type;
@@ -1076,8 +1073,7 @@ fail:
 fail2:
 	device_unregister(&mci->dev);
 	bus_unregister(mci->bus);
-	kfree(name);
-
+	kfree(mci->bus->name);
 	return err;
 }
 
@@ -1108,12 +1104,10 @@ void edac_remove_sysfs_mci_device(struct mem_ctl_info *mci)
 
 void edac_unregister_sysfs(struct mem_ctl_info *mci)
 {
-	const char *name = mci->bus->name;
-
 	edac_dbg(1, "Unregistering device %s\n", dev_name(&mci->dev));
 	device_unregister(&mci->dev);
 	bus_unregister(mci->bus);
-	kfree(name);
+	kfree(mci->bus->name);
 }
 
 static void mc_attr_release(struct device *dev)

@@ -28,12 +28,11 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
-#include <linux/of_i2c.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/platform_data/dma-atmel.h>
 
-#define TWI_CLK_HZ		100000			/* max 400 Kbits/s */
+#define DEFAULT_TWI_CLK_HZ		100000		/* max 400 Kbits/s */
 #define AT91_I2C_TIMEOUT	msecs_to_jiffies(100)	/* transfer timeout */
 #define AT91_I2C_DMA_THRESHOLD	8			/* enable DMA if transfer size is bigger than this threshold */
 
@@ -273,14 +272,8 @@ error:
 
 static void at91_twi_read_next_byte(struct at91_twi_dev *dev)
 {
-	/*
-	 * If we are in this case, it means there is garbage data in RHR, so
-	 * delete them.
-	 */
-	if (!dev->buf_len) {
-		at91_twi_read(dev, AT91_TWI_RHR);
+	if (dev->buf_len <= 0)
 		return;
-	}
 
 	*dev->buf = at91_twi_read(dev, AT91_TWI_RHR) & 0xff;
 	--dev->buf_len;
@@ -377,72 +370,18 @@ static irqreturn_t atmel_twi_interrupt(int irq, void *dev_id)
 
 	if (!irqstatus)
 		return IRQ_NONE;
-	/*
-	 * In reception, the behavior of the twi device (before sama5d2) is
-	 * weird. There is some magic about RXRDY flag! When a data has been
-	 * almost received, the reception of a new one is anticipated if there
-	 * is no stop command to send. That is the reason why ask for sending
-	 * the stop command not on the last data but on the second last one.
-	 *
-	 * Unfortunately, we could still have the RXRDY flag set even if the
-	 * transfer is done and we have read the last data. It might happen
-	 * when the i2c slave device sends too quickly data after receiving the
-	 * ack from the master. The data has been almost received before having
-	 * the order to send stop. In this case, sending the stop command could
-	 * cause a RXRDY interrupt with a TXCOMP one. It is better to manage
-	 * the RXRDY interrupt first in order to not keep garbage data in the
-	 * Receive Holding Register for the next transfer.
-	 */
-	if (irqstatus & AT91_TWI_RXRDY)
+	else if (irqstatus & AT91_TWI_RXRDY)
 		at91_twi_read_next_byte(dev);
-
-	/*
-	 * When a NACK condition is detected, the I2C controller sets the NACK,
-	 * TXCOMP and TXRDY bits all together in the Status Register (SR).
-	 *
-	 * 1 - Handling NACK errors with CPU write transfer.
-	 *
-	 * In such case, we should not write the next byte into the Transmit
-	 * Holding Register (THR) otherwise the I2C controller would start a new
-	 * transfer and the I2C slave is likely to reply by another NACK.
-	 *
-	 * 2 - Handling NACK errors with DMA write transfer.
-	 *
-	 * By setting the TXRDY bit in the SR, the I2C controller also triggers
-	 * the DMA controller to write the next data into the THR. Then the
-	 * result depends on the hardware version of the I2C controller.
-	 *
-	 * 2a - Without support of the Alternative Command mode.
-	 *
-	 * This is the worst case: the DMA controller is triggered to write the
-	 * next data into the THR, hence starting a new transfer: the I2C slave
-	 * is likely to reply by another NACK.
-	 * Concurrently, this interrupt handler is likely to be called to manage
-	 * the first NACK before the I2C controller detects the second NACK and
-	 * sets once again the NACK bit into the SR.
-	 * When handling the first NACK, this interrupt handler disables the I2C
-	 * controller interruptions, especially the NACK interrupt.
-	 * Hence, the NACK bit is pending into the SR. This is why we should
-	 * read the SR to clear all pending interrupts at the beginning of
-	 * at91_do_twi_transfer() before actually starting a new transfer.
-	 *
-	 * 2b - With support of the Alternative Command mode.
-	 *
-	 * When a NACK condition is detected, the I2C controller also locks the
-	 * THR (and sets the LOCK bit in the SR): even though the DMA controller
-	 * is triggered by the TXRDY bit to write the next data into the THR,
-	 * this data actually won't go on the I2C bus hence a second NACK is not
-	 * generated.
-	 */
-	if (irqstatus & (AT91_TWI_TXCOMP | AT91_TWI_NACK)) {
-		at91_disable_twi_interrupts(dev);
-		complete(&dev->cmd_complete);
-	} else if (irqstatus & AT91_TWI_TXRDY) {
+	else if (irqstatus & AT91_TWI_TXRDY)
 		at91_twi_write_next_byte(dev);
-	}
 
 	/* catch error flags */
 	dev->transfer_status |= status;
+
+	if (irqstatus & (AT91_TWI_TXCOMP | AT91_TWI_NACK)) {
+		at91_disable_twi_interrupts(dev);
+		complete(&dev->cmd_complete);
+	}
 
 	return IRQ_HANDLED;
 }
@@ -483,17 +422,19 @@ static int at91_do_twi_transfer(struct at91_twi_dev *dev)
 	dev_dbg(dev->dev, "transfer: %s %d bytes.\n",
 		(dev->msg->flags & I2C_M_RD) ? "read" : "write", dev->buf_len);
 
-	INIT_COMPLETION(dev->cmd_complete);
+	reinit_completion(&dev->cmd_complete);
 	dev->transfer_status = 0;
-
-	/* Clear pending interrupts, such as NACK. */
-	at91_twi_read(dev, AT91_TWI_SR);
 
 	if (!dev->buf_len) {
 		at91_twi_write(dev, AT91_TWI_CR, AT91_TWI_QUICK);
 		at91_twi_write(dev, AT91_TWI_IER, AT91_TWI_TXCOMP);
 	} else if (dev->msg->flags & I2C_M_RD) {
 		unsigned start_flags = AT91_TWI_START;
+
+		if (at91_twi_read(dev, AT91_TWI_SR) & AT91_TWI_RXRDY) {
+			dev_err(dev->dev, "RXRDY still set!");
+			at91_twi_read(dev, AT91_TWI_RHR);
+		}
 
 		/* if only one byte is to be read, immediately stop transfer */
 		if (dev->buf_len <= 1 && !(dev->msg->flags & I2C_M_RECV_LEN))
@@ -704,6 +645,9 @@ static const struct of_device_id atmel_twi_dt_ids[] = {
 		.compatible = "atmel,at91sam9260-i2c",
 		.data = &at91sam9260_config,
 	} , {
+		.compatible = "atmel,at91sam9261-i2c",
+		.data = &at91sam9261_config,
+	} , {
 		.compatible = "atmel,at91sam9g20-i2c",
 		.data = &at91sam9g20_config,
 	} , {
@@ -823,6 +767,7 @@ static int at91_twi_probe(struct platform_device *pdev)
 	struct resource *mem;
 	int rc;
 	u32 phy_addr;
+	u32 bus_clk_rate;
 
 	dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
 	if (!dev)
@@ -868,13 +813,18 @@ static int at91_twi_probe(struct platform_device *pdev)
 			dev->use_dma = true;
 	}
 
-	at91_calc_twi_clock(dev, TWI_CLK_HZ);
+	rc = of_property_read_u32(dev->dev->of_node, "clock-frequency",
+			&bus_clk_rate);
+	if (rc)
+		bus_clk_rate = DEFAULT_TWI_CLK_HZ;
+
+	at91_calc_twi_clock(dev, bus_clk_rate);
 	at91_init_twi_bus(dev);
 
 	snprintf(dev->adapter.name, sizeof(dev->adapter.name), "AT91");
 	i2c_set_adapdata(&dev->adapter, dev);
 	dev->adapter.owner = THIS_MODULE;
-	dev->adapter.class = I2C_CLASS_HWMON;
+	dev->adapter.class = I2C_CLASS_DEPRECATED;
 	dev->adapter.algo = &at91_twi_algorithm;
 	dev->adapter.dev.parent = dev->dev;
 	dev->adapter.nr = pdev->id;
@@ -888,8 +838,6 @@ static int at91_twi_probe(struct platform_device *pdev)
 		clk_disable_unprepare(dev->clk);
 		return rc;
 	}
-
-	of_i2c_register_devices(&dev->adapter);
 
 	dev_info(dev->dev, "AT91 i2c bus driver.\n");
 	return 0;

@@ -56,9 +56,9 @@ static __inline__ int scm_check_creds(struct ucred *creds)
 	if ((creds->pid == task_tgid_vnr(current) ||
 	     ns_capable(task_active_pid_ns(current)->user_ns, CAP_SYS_ADMIN)) &&
 	    ((uid_eq(uid, cred->uid)   || uid_eq(uid, cred->euid) ||
-	      uid_eq(uid, cred->suid)) || nsown_capable(CAP_SETUID)) &&
+	      uid_eq(uid, cred->suid)) || ns_capable(cred->user_ns, CAP_SETUID)) &&
 	    ((gid_eq(gid, cred->gid)   || gid_eq(gid, cred->egid) ||
-	      gid_eq(gid, cred->sgid)) || nsown_capable(CAP_SETGID))) {
+	      gid_eq(gid, cred->sgid)) || ns_capable(cred->user_ns, CAP_SETGID))) {
 	       return 0;
 	}
 	return -EPERM;
@@ -87,7 +87,6 @@ static int scm_fp_copy(struct cmsghdr *cmsg, struct scm_fp_list **fplp)
 		*fplp = fpl;
 		fpl->count = 0;
 		fpl->max = SCM_MAX_FD;
-		fpl->user = NULL;
 	}
 	fpp = &fpl->fp[fpl->count];
 
@@ -108,10 +107,6 @@ static int scm_fp_copy(struct cmsghdr *cmsg, struct scm_fp_list **fplp)
 		*fpp++ = file;
 		fpl->count++;
 	}
-
-	if (!fpl->user)
-		fpl->user = get_uid(current_user());
-
 	return num;
 }
 
@@ -124,7 +119,6 @@ void __scm_destroy(struct scm_cookie *scm)
 		scm->fp = NULL;
 		for (i=fpl->count-1; i>=0; i--)
 			fput(fpl->fp[i]);
-		free_uid(fpl->user);
 		kfree(fpl);
 	}
 }
@@ -343,7 +337,6 @@ struct scm_fp_list *scm_fp_dup(struct scm_fp_list *fpl)
 		for (i = 0; i < fpl->count; i++)
 			get_file(fpl->fp[i]);
 		new_fpl->max = new_fpl->count;
-		new_fpl->user = get_uid(fpl->user);
 	}
 	return new_fpl;
 }

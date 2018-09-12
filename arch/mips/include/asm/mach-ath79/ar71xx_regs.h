@@ -16,7 +16,6 @@
 #define __ASM_MACH_AR71XX_REGS_H
 
 #include <linux/types.h>
-#include <linux/init.h>
 #include <linux/io.h>
 #include <linux/bitops.h>
 
@@ -168,7 +167,7 @@
 #define AR71XX_AHB_DIV_MASK		0x7
 
 #define AR724X_PLL_REG_CPU_CONFIG	0x00
-#define AR724X_PLL_REG_PCIE_CONFIG	0x18
+#define AR724X_PLL_REG_PCIE_CONFIG	0x10
 
 #define AR724X_PLL_DIV_SHIFT		0
 #define AR724X_PLL_DIV_MASK		0x3ff

@@ -118,7 +118,7 @@
  *	       7	FPU/R4k timer
  *
  * We handle the IRQ according to _our_ priority (see setup.c),
- * then we just return.	 If multiple IRQs are pending then we will
+ * then we just return.  If multiple IRQs are pending then we will
  * just take another exception, big deal.
  */
 		.align	5
@@ -146,7 +146,25 @@
 		/*
 		 * Find irq with highest priority
 		 */
-		 PTR_LA t1,cpu_mask_nr_tbl
+		# open coded PTR_LA t1, cpu_mask_nr_tbl
+#if (_MIPS_SZPTR == 32)
+		# open coded la t1, cpu_mask_nr_tbl
+		lui	t1, %hi(cpu_mask_nr_tbl)
+		addiu	t1, %lo(cpu_mask_nr_tbl)
+
+#endif
+#if (_MIPS_SZPTR == 64)
+		# open coded dla t1, cpu_mask_nr_tbl
+		.set	push
+		.set	noat
+		lui	t1, %highest(cpu_mask_nr_tbl)
+		lui	AT, %hi(cpu_mask_nr_tbl)
+		daddiu	t1, t1, %higher(cpu_mask_nr_tbl)
+		daddiu	AT, AT, %lo(cpu_mask_nr_tbl)
+		dsll	t1, 32
+		daddu	t1, t1, AT
+		.set	pop
+#endif
 1:		lw	t2,(t1)
 		nop
 		and	t2,t0
@@ -195,7 +213,25 @@
 		/*
 		 * Find irq with highest priority
 		 */
-		 PTR_LA t1,asic_mask_nr_tbl
+		# open coded PTR_LA t1,asic_mask_nr_tbl
+#if (_MIPS_SZPTR == 32)
+		# open coded la t1, asic_mask_nr_tbl
+		lui	t1, %hi(asic_mask_nr_tbl)
+		addiu	t1, %lo(asic_mask_nr_tbl)
+
+#endif
+#if (_MIPS_SZPTR == 64)
+		# open coded dla t1, asic_mask_nr_tbl
+		.set	push
+		.set	noat
+		lui	t1, %highest(asic_mask_nr_tbl)
+		lui	AT, %hi(asic_mask_nr_tbl)
+		daddiu	t1, t1, %higher(asic_mask_nr_tbl)
+		daddiu	AT, AT, %lo(asic_mask_nr_tbl)
+		dsll	t1, 32
+		daddu	t1, t1, AT
+		.set	pop
+#endif
 2:		lw	t2,(t1)
 		nop
 		and	t2,t0
@@ -221,7 +257,7 @@
 		FEXPORT(cpu_all_int)		# HALT, timers, software junk
 		li	a0,DEC_CPU_IRQ_BASE
 		srl	t0,CAUSEB_IP
-		li	t1,CAUSEF_IP>>CAUSEB_IP # mask
+		li	t1,CAUSEF_IP>>CAUSEB_IP	# mask
 		b	1f
 		 li	t2,4			# nr of bits / 2
 

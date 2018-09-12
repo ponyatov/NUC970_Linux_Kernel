@@ -21,6 +21,7 @@
 /*
  * User space memory access functions
  */
+#include <linux/bitops.h>
 #include <linux/string.h>
 #include <linux/thread_info.h>
 
@@ -83,23 +84,32 @@ static inline void set_fs(mm_segment_t fs)
  * Returns 1 if the range is valid, 0 otherwise.
  *
  * This is equivalent to the following test:
- * (u65)addr + (u65)size < (u65)current->addr_limit
+ * (u65)addr + (u65)size <= current->addr_limit
  *
  * This needs 65-bit arithmetic.
  */
 #define __range_ok(addr, size)						\
 ({									\
+	unsigned long __addr = (unsigned long __force)(addr);		\
 	unsigned long flag, roksum;					\
 	__chk_user_ptr(addr);						\
-	asm("adds %1, %1, %3; ccmp %1, %4, #2, cc; cset %0, cc"		\
+	asm("adds %1, %1, %3; ccmp %1, %4, #2, cc; cset %0, ls"		\
 		: "=&r" (flag), "=&r" (roksum)				\
-		: "1" (addr), "Ir" (size),				\
+		: "1" (__addr), "Ir" (size),				\
 		  "r" (current_thread_info()->addr_limit)		\
 		: "cc");						\
 	flag;								\
 })
 
+/*
+ * When dealing with data aborts, watchpoints, or instruction traps we may end
+ * up with a tagged userland pointer. Clear the tag to get a sane pointer to
+ * pass on to access_ok(), for instance.
+ */
+#define untagged_addr(addr)		sign_extend64(addr, 55)
+
 #define access_ok(type, addr, size)	__range_ok(addr, size)
+#define user_addr_max			get_fs
 
 /*
  * The "__xxx" versions of the user access functions do not verify the address
@@ -166,9 +176,10 @@ do {									\
 
 #define get_user(x, ptr)						\
 ({									\
-	might_sleep();							\
-	access_ok(VERIFY_READ, (ptr), sizeof(*(ptr))) ?			\
-		__get_user((x), (ptr)) :				\
+	__typeof__(*(ptr)) __user *__p = (ptr);				\
+	might_fault();							\
+	access_ok(VERIFY_READ, __p, sizeof(*__p)) ?			\
+		__get_user((x), __p) :					\
 		((x) = 0, -EFAULT);					\
 })
 
@@ -227,9 +238,10 @@ do {									\
 
 #define put_user(x, ptr)						\
 ({									\
-	might_sleep();							\
-	access_ok(VERIFY_WRITE, (ptr), sizeof(*(ptr))) ?		\
-		__put_user((x), (ptr)) :				\
+	__typeof__(*(ptr)) __user *__p = (ptr);				\
+	might_fault();							\
+	access_ok(VERIFY_WRITE, __p, sizeof(*__p)) ?			\
+		__put_user((x), __p) :					\
 		-EFAULT;						\
 })
 
@@ -237,9 +249,6 @@ extern unsigned long __must_check __copy_from_user(void *to, const void __user *
 extern unsigned long __must_check __copy_to_user(void __user *to, const void *from, unsigned long n);
 extern unsigned long __must_check __copy_in_user(void __user *to, const void __user *from, unsigned long n);
 extern unsigned long __must_check __clear_user(void __user *addr, unsigned long n);
-
-extern unsigned long __must_check __strncpy_from_user(char *to, const char __user *from, unsigned long count);
-extern unsigned long __must_check __strnlen_user(const char __user *s, long n);
 
 static inline unsigned long __must_check copy_from_user(void *to, const void __user *from, unsigned long n)
 {
@@ -274,24 +283,9 @@ static inline unsigned long __must_check clear_user(void __user *to, unsigned lo
 	return n;
 }
 
-static inline long __must_check strncpy_from_user(char *dst, const char __user *src, long count)
-{
-	long res = -EFAULT;
-	if (access_ok(VERIFY_READ, src, 1))
-		res = __strncpy_from_user(dst, src, count);
-	return res;
-}
+extern long strncpy_from_user(char *dest, const char __user *src, long count);
 
-#define strlen_user(s)	strnlen_user(s, ~0UL >> 1)
-
-static inline long __must_check strnlen_user(const char __user *s, long n)
-{
-	unsigned long res = 0;
-
-	if (__addr_ok(s))
-		res = __strnlen_user(s, n);
-
-	return res;
-}
+extern __must_check long strlen_user(const char __user *str);
+extern __must_check long strnlen_user(const char __user *str, long n);
 
 #endif /* __ASM_UACCESS_H */

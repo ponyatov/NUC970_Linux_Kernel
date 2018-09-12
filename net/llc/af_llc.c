@@ -197,9 +197,19 @@ static int llc_ui_release(struct socket *sock)
 		llc->laddr.lsap, llc->daddr.lsap);
 	if (!llc_send_disc(sk))
 		llc_ui_wait_for_disc(sk, sk->sk_rcvtimeo);
-	if (!sock_flag(sk, SOCK_ZAPPED))
+	if (!sock_flag(sk, SOCK_ZAPPED)) {
+		struct llc_sap *sap = llc->sap;
+
+		/* Hold this for release_sock(), so that llc_backlog_rcv()
+		 * could still use it.
+		 */
+		llc_sap_hold(sap);
 		llc_sap_remove_socket(llc->sap, sk);
-	release_sock(sk);
+		release_sock(sk);
+		llc_sap_put(sap);
+	} else {
+		release_sock(sk);
+	}
 	if (llc->dev)
 		dev_put(llc->dev);
 	sock_put(sk);
@@ -309,6 +319,8 @@ static int llc_ui_bind(struct socket *sock, struct sockaddr *uaddr, int addrlen)
 	int rc = -EINVAL;
 
 	dprintk("%s: binding %02X\n", __func__, addr->sllc_sap);
+
+	lock_sock(sk);
 	if (unlikely(!sock_flag(sk, SOCK_ZAPPED) || addrlen != sizeof(*addr)))
 		goto out;
 	rc = -EAFNOSUPPORT;
@@ -321,12 +333,12 @@ static int llc_ui_bind(struct socket *sock, struct sockaddr *uaddr, int addrlen)
 		if (llc->dev) {
 			if (!addr->sllc_arphrd)
 				addr->sllc_arphrd = llc->dev->type;
-			if (llc_mac_null(addr->sllc_mac))
+			if (is_zero_ether_addr(addr->sllc_mac))
 				memcpy(addr->sllc_mac, llc->dev->dev_addr,
 				       IFHWADDRLEN);
 			if (addr->sllc_arphrd != llc->dev->type ||
-			    !llc_mac_match(addr->sllc_mac,
-					   llc->dev->dev_addr)) {
+			    !ether_addr_equal(addr->sllc_mac,
+					      llc->dev->dev_addr)) {
 				rc = -EINVAL;
 				llc->dev = NULL;
 			}
@@ -380,6 +392,7 @@ static int llc_ui_bind(struct socket *sock, struct sockaddr *uaddr, int addrlen)
 out_put:
 	llc_sap_put(sap);
 out:
+	release_sock(sk);
 	return rc;
 }
 
@@ -708,7 +721,7 @@ out:
 static int llc_ui_recvmsg(struct kiocb *iocb, struct socket *sock,
 			  struct msghdr *msg, size_t len, int flags)
 {
-	struct sockaddr_llc *uaddr = (struct sockaddr_llc *)msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_llc *, uaddr, msg->msg_name);
 	const int nonblock = flags & MSG_DONTWAIT;
 	struct sk_buff *skb = NULL;
 	struct sock *sk = sock->sk;
@@ -840,7 +853,7 @@ static int llc_ui_recvmsg(struct kiocb *iocb, struct socket *sock,
 
 		if (!(flags & MSG_PEEK)) {
 			spin_lock_irqsave(&sk->sk_receive_queue.lock, cpu_flags);
-			sk_eat_skb(sk, skb, false);
+			sk_eat_skb(sk, skb);
 			spin_unlock_irqrestore(&sk->sk_receive_queue.lock, cpu_flags);
 			*seq = 0;
 		}
@@ -862,10 +875,10 @@ copy_uaddr:
 		llc_cmsg_rcv(msg, skb);
 
 	if (!(flags & MSG_PEEK)) {
-			spin_lock_irqsave(&sk->sk_receive_queue.lock, cpu_flags);
-			sk_eat_skb(sk, skb, false);
-			spin_unlock_irqrestore(&sk->sk_receive_queue.lock, cpu_flags);
-			*seq = 0;
+		spin_lock_irqsave(&sk->sk_receive_queue.lock, cpu_flags);
+		sk_eat_skb(sk, skb);
+		spin_unlock_irqrestore(&sk->sk_receive_queue.lock, cpu_flags);
+		*seq = 0;
 	}
 
 	goto out;
@@ -885,7 +898,7 @@ static int llc_ui_sendmsg(struct kiocb *iocb, struct socket *sock,
 {
 	struct sock *sk = sock->sk;
 	struct llc_sock *llc = llc_sk(sk);
-	struct sockaddr_llc *addr = (struct sockaddr_llc *)msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_llc *, addr, msg->msg_name);
 	int flags = msg->msg_flags;
 	int noblock = flags & MSG_DONTWAIT;
 	struct sk_buff *skb;
@@ -915,6 +928,9 @@ static int llc_ui_sendmsg(struct kiocb *iocb, struct socket *sock,
 	if (size > llc->dev->mtu)
 		size = llc->dev->mtu;
 	copied = size - hdrlen;
+	rc = -EINVAL;
+	if (copied < 0)
+		goto release;
 	release_sock(sk);
 	skb = sock_alloc_send_skb(sk, size, noblock, &rc);
 	lock_sock(sk);

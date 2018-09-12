@@ -349,7 +349,7 @@ poll_again:
 			}
 			kdb_printf("\n");
 			for (i = 0; i < count; i++) {
-				if (kallsyms_symbol_next(p_tmp, i) < 0)
+				if (WARN_ON(!kallsyms_symbol_next(p_tmp, i)))
 					break;
 				kdb_printf("%s ", p_tmp);
 				*(p_tmp + len) = '\0';
@@ -710,7 +710,7 @@ kdb_printit:
 	}
 	if (logging) {
 		saved_loglevel = console_loglevel;
-		console_loglevel = 0;
+		console_loglevel = CONSOLE_LOGLEVEL_SILENT;
 		printk(KERN_INFO "%s", kdb_buffer);
 	}
 

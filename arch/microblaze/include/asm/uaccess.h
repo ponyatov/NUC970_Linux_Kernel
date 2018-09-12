@@ -98,13 +98,13 @@ static inline int access_ok(int type, const void __user *addr,
 
 	if ((get_fs().seg < ((unsigned long)addr)) ||
 			(get_fs().seg < ((unsigned long)addr + size - 1))) {
-		pr_debug("ACCESS fail: %s at 0x%08x (size 0x%x), seg 0x%08x\n",
+		pr_devel("ACCESS fail: %s at 0x%08x (size 0x%x), seg 0x%08x\n",
 			type ? "WRITE" : "READ ", (__force u32)addr, (u32)size,
 			(u32)get_fs().seg);
 		return 0;
 	}
 ok:
-	pr_debug("ACCESS OK: %s at 0x%08x (size 0x%x), seg 0x%08x\n",
+	pr_devel("ACCESS OK: %s at 0x%08x (size 0x%x), seg 0x%08x\n",
 			type ? "WRITE" : "READ ", (__force u32)addr, (u32)size,
 			(u32)get_fs().seg);
 	return 1;
@@ -145,7 +145,7 @@ static inline unsigned long __must_check __clear_user(void __user *to,
 static inline unsigned long __must_check clear_user(void __user *to,
 							unsigned long n)
 {
-	might_sleep();
+	might_fault();
 	if (unlikely(!access_ok(VERIFY_WRITE, to, n)))
 		return n;
 
@@ -372,7 +372,7 @@ static inline long copy_from_user(void *to,
 		const void __user *from, unsigned long n)
 {
 	unsigned long res = n;
-	might_sleep();
+	might_fault();
 	if (likely(access_ok(VERIFY_READ, from, n)))
 		res = __copy_from_user(to, from, n);
 	if (unlikely(res))
@@ -388,7 +388,7 @@ static inline long copy_from_user(void *to,
 static inline long copy_to_user(void __user *to,
 		const void *from, unsigned long n)
 {
-	might_sleep();
+	might_fault();
 	if (access_ok(VERIFY_WRITE, to, n))
 		return __copy_to_user(to, from, n);
 	return n;

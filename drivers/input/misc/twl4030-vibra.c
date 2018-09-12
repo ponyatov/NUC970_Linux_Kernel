@@ -180,20 +180,25 @@ static SIMPLE_DEV_PM_OPS(twl4030_vibra_pm_ops,
 			 twl4030_vibra_suspend, twl4030_vibra_resume);
 
 static bool twl4030_vibra_check_coexist(struct twl4030_vibra_data *pdata,
-			      struct device_node *node)
+			      struct device_node *parent)
 {
+	struct device_node *node;
+
 	if (pdata && pdata->coexist)
 		return true;
 
-	if (of_find_node_by_name(node, "codec"))
+	node = of_get_child_by_name(parent, "codec");
+	if (node) {
+		of_node_put(node);
 		return true;
+	}
 
 	return false;
 }
 
 static int twl4030_vibra_probe(struct platform_device *pdev)
 {
-	struct twl4030_vibra_data *pdata = pdev->dev.platform_data;
+	struct twl4030_vibra_data *pdata = dev_get_platdata(&pdev->dev);
 	struct device_node *twl4030_core_node = pdev->dev.parent->of_node;
 	struct vibra_info *info;
 	int ret;

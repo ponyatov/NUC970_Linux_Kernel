@@ -21,9 +21,7 @@
 #include <linux/ptrace.h>
 #include <linux/device.h>
 #include <linux/highmem.h>
-#include <linux/crash_dump.h>
 #include <linux/backing-dev.h>
-#include <linux/bootmem.h>
 #include <linux/splice.h>
 #include <linux/pfn.h>
 #include <linux/export.h>
@@ -35,11 +33,6 @@
 #ifdef CONFIG_IA64
 # include <linux/efi.h>
 #endif
-
-#ifdef CONFIG_NUC970_MEM
-# include "nuc970_mem.h"
-#endif
-
 
 #define DEVPORT_MINOR	4
 
@@ -77,8 +70,12 @@ static inline int range_is_allowed(unsigned long pfn, unsigned long size)
 	u64 cursor = from;
 
 	while (cursor < to) {
-		if (!devmem_is_allowed(pfn))
+		if (!devmem_is_allowed(pfn)) {
+			printk(KERN_INFO
+		"Program %s tried to access /dev/mem between %Lx->%Lx.\n",
+				current->comm, from, to);
 			return 0;
+		}
 		cursor += PAGE_SIZE;
 		pfn++;
 	}
@@ -109,6 +106,9 @@ static ssize_t read_mem(struct file *file, char __user *buf,
 	phys_addr_t p = *ppos;
 	ssize_t read, sz;
 	char *ptr;
+
+	if (p != *ppos)
+		return 0;
 
 	if (!valid_phys_addr_range(p, count))
 		return -EFAULT;
@@ -175,6 +175,9 @@ static ssize_t write_mem(struct file *file, const char __user *buf,
 	ssize_t written, sz;
 	unsigned long copied;
 	void *ptr;
+
+	if (p != *ppos)
+		return -EFBIG;
 
 	if (!valid_phys_addr_range(p, count))
 		return -EFAULT;
@@ -326,6 +329,11 @@ static const struct vm_operations_struct mmap_mem_ops = {
 static int mmap_mem(struct file *file, struct vm_area_struct *vma)
 {
 	size_t size = vma->vm_end - vma->vm_start;
+	phys_addr_t offset = (phys_addr_t)vma->vm_pgoff << PAGE_SHIFT;
+
+	/* It's illegal to wrap around the end of the physical address space. */
+	if (offset + (phys_addr_t)size - 1 < offset)
+		return -EINVAL;
 
 	if (!valid_mmap_phys_addr_range(vma->vm_pgoff, size))
 		return -EINVAL;
@@ -377,40 +385,6 @@ static int mmap_kmem(struct file *file, struct vm_area_struct *vma)
 
 	vma->vm_pgoff = pfn;
 	return mmap_mem(file, vma);
-}
-#endif
-
-#ifdef CONFIG_CRASH_DUMP
-/*
- * Read memory corresponding to the old kernel.
- */
-static ssize_t read_oldmem(struct file *file, char __user *buf,
-				size_t count, loff_t *ppos)
-{
-	unsigned long pfn, offset;
-	size_t read = 0, csize;
-	int rc = 0;
-
-	while (count) {
-		pfn = *ppos / PAGE_SIZE;
-		if (pfn > saved_max_pfn)
-			return read;
-
-		offset = (unsigned long)(*ppos % PAGE_SIZE);
-		if (count > PAGE_SIZE - offset)
-			csize = PAGE_SIZE - offset;
-		else
-			csize = count;
-
-		rc = copy_oldmem_page(pfn, buf, csize, offset, 1);
-		if (rc < 0)
-			return rc;
-		buf += csize;
-		*ppos += csize;
-		read += csize;
-		count -= csize;
-	}
-	return read;
 }
 #endif
 
@@ -675,53 +649,23 @@ static ssize_t splice_write_null(struct pipe_inode_info *pipe, struct file *out,
 	return splice_from_pipe(pipe, out, ppos, len, flags, pipe_to_null);
 }
 
-static ssize_t read_zero(struct file *file, char __user *buf,
-			 size_t count, loff_t *ppos)
-{
-	size_t written;
-
-	if (!count)
-		return 0;
-
-	if (!access_ok(VERIFY_WRITE, buf, count))
-		return -EFAULT;
-
-	written = 0;
-	while (count) {
-		unsigned long unwritten;
-		size_t chunk = count;
-
-		if (chunk > PAGE_SIZE)
-			chunk = PAGE_SIZE;	/* Just for latency reasons */
-		unwritten = __clear_user(buf, chunk);
-		written += chunk - unwritten;
-		if (unwritten)
-			break;
-		if (signal_pending(current))
-			return written ? written : -ERESTARTSYS;
-		buf += chunk;
-		count -= chunk;
-		cond_resched();
-	}
-	return written ? written : -EFAULT;
-}
-
-static ssize_t aio_read_zero(struct kiocb *iocb, const struct iovec *iov,
-			     unsigned long nr_segs, loff_t pos)
+static ssize_t read_iter_zero(struct kiocb *iocb, struct iov_iter *iter)
 {
 	size_t written = 0;
-	unsigned long i;
-	ssize_t ret;
 
-	for (i = 0; i < nr_segs; i++) {
-		ret = read_zero(iocb->ki_filp, iov[i].iov_base, iov[i].iov_len,
-				&pos);
-		if (ret < 0)
-			break;
-		written += ret;
+	while (iov_iter_count(iter)) {
+		size_t chunk = iov_iter_count(iter), n;
+		if (chunk > PAGE_SIZE)
+			chunk = PAGE_SIZE;	/* Just for latency reasons */
+		n = iov_iter_zero(chunk, iter);
+		if (!n && iov_iter_count(iter))
+			return written ? written : -EFAULT;
+		written += n;
+		if (signal_pending(current))
+			return written ? written : -ERESTARTSYS;
+		cond_resched();
 	}
-
-	return written ? written : -EFAULT;
+	return written;
 }
 
 static int mmap_zero(struct file *file, struct vm_area_struct *vma)
@@ -768,7 +712,7 @@ static loff_t memory_lseek(struct file *file, loff_t offset, int orig)
 		offset += file->f_pos;
 	case SEEK_SET:
 		/* to avoid userland mistaking f_pos=-9 as -EBADF=-9 */
-		if ((unsigned long long)offset >= ~0xFFFULL) {
+		if (IS_ERR_VALUE((unsigned long long)offset)) {
 			ret = -EOVERFLOW;
 			break;
 		}
@@ -791,11 +735,9 @@ static int open_port(struct inode *inode, struct file *filp)
 #define zero_lseek	null_lseek
 #define full_lseek      null_lseek
 #define write_zero	write_null
-#define read_full       read_zero
 #define aio_write_zero	aio_write_null
 #define open_mem	open_port
 #define open_kmem	open_mem
-#define open_oldmem	open_mem
 
 static const struct file_operations mem_fops = {
 	.llseek		= memory_lseek,
@@ -837,9 +779,9 @@ static const struct file_operations port_fops = {
 
 static const struct file_operations zero_fops = {
 	.llseek		= zero_lseek,
-	.read		= read_zero,
+	.read		= new_sync_read,
 	.write		= write_zero,
-	.aio_read	= aio_read_zero,
+	.read_iter	= read_iter_zero,
 	.aio_write	= aio_write_zero,
 	.mmap		= mmap_zero,
 };
@@ -856,27 +798,10 @@ static struct backing_dev_info zero_bdi = {
 
 static const struct file_operations full_fops = {
 	.llseek		= full_lseek,
-	.read		= read_full,
+	.read		= new_sync_read,
+	.read_iter	= read_iter_zero,
 	.write		= write_full,
 };
-
-#ifdef CONFIG_CRASH_DUMP
-static const struct file_operations oldmem_fops = {
-	.read	= read_oldmem,
-	.open	= open_oldmem,
-	.llseek = default_llseek,
-};
-#endif
-
-#ifdef CONFIG_NUC970_MEM
-extern int nuc970_mem_mmap(struct file* filp, struct vm_area_struct *vma);
-extern long nuc970_mem_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
-
-static const struct file_operations nuc970_mem_fops = {
-	.unlocked_ioctl	= nuc970_mem_ioctl,
-	.mmap   = nuc970_mem_mmap,
-};
-#endif
 
 static const struct memdev {
 	const char *name;
@@ -898,13 +823,6 @@ static const struct memdev {
 	 [9] = { "urandom", 0666, &urandom_fops, NULL },
 #ifdef CONFIG_PRINTK
 	[11] = { "kmsg", 0644, &kmsg_fops, NULL },
-#endif
-#ifdef CONFIG_CRASH_DUMP
-	[12] = { "oldmem", 0, &oldmem_fops, NULL },
-#endif
-#ifdef CONFIG_NUC970_MEM
-	[13] = {"nuc970-mem", S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH
-			| S_IWOTH, &nuc970_mem_fops},
 #endif
 };
 

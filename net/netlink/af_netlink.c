@@ -57,7 +57,10 @@
 #include <linux/audit.h>
 #include <linux/mutex.h>
 #include <linux/vmalloc.h>
+#include <linux/if_arp.h>
+#include <linux/rhashtable.h>
 #include <asm/cacheflush.h>
+#include <linux/hash.h>
 
 #include <net/net_namespace.h>
 #include <net/sock.h>
@@ -90,25 +93,237 @@ EXPORT_SYMBOL_GPL(nl_table);
 
 static DECLARE_WAIT_QUEUE_HEAD(nl_table_wait);
 
+static struct lock_class_key nlk_cb_mutex_keys[MAX_LINKS];
+
+static const char *const nlk_cb_mutex_key_strings[MAX_LINKS + 1] = {
+	"nlk_cb_mutex-ROUTE",
+	"nlk_cb_mutex-1",
+	"nlk_cb_mutex-USERSOCK",
+	"nlk_cb_mutex-FIREWALL",
+	"nlk_cb_mutex-SOCK_DIAG",
+	"nlk_cb_mutex-NFLOG",
+	"nlk_cb_mutex-XFRM",
+	"nlk_cb_mutex-SELINUX",
+	"nlk_cb_mutex-ISCSI",
+	"nlk_cb_mutex-AUDIT",
+	"nlk_cb_mutex-FIB_LOOKUP",
+	"nlk_cb_mutex-CONNECTOR",
+	"nlk_cb_mutex-NETFILTER",
+	"nlk_cb_mutex-IP6_FW",
+	"nlk_cb_mutex-DNRTMSG",
+	"nlk_cb_mutex-KOBJECT_UEVENT",
+	"nlk_cb_mutex-GENERIC",
+	"nlk_cb_mutex-17",
+	"nlk_cb_mutex-SCSITRANSPORT",
+	"nlk_cb_mutex-ECRYPTFS",
+	"nlk_cb_mutex-RDMA",
+	"nlk_cb_mutex-CRYPTO",
+	"nlk_cb_mutex-SMC",
+	"nlk_cb_mutex-23",
+	"nlk_cb_mutex-24",
+	"nlk_cb_mutex-25",
+	"nlk_cb_mutex-26",
+	"nlk_cb_mutex-27",
+	"nlk_cb_mutex-28",
+	"nlk_cb_mutex-29",
+	"nlk_cb_mutex-30",
+	"nlk_cb_mutex-31",
+	"nlk_cb_mutex-MAX_LINKS"
+};
+
 static int netlink_dump(struct sock *sk);
 static void netlink_skb_destructor(struct sk_buff *skb);
 
+/* nl_table locking explained:
+ * Lookup and traversal are protected with nl_sk_hash_lock or nl_table_lock
+ * combined with an RCU read-side lock. Insertion and removal are protected
+ * with nl_sk_hash_lock while using RCU list modification primitives and may
+ * run in parallel to nl_table_lock protected lookups. Destruction of the
+ * Netlink socket may only occur *after* nl_table_lock has been acquired
+ * either during or after the socket has been removed from the list.
+ */
 DEFINE_RWLOCK(nl_table_lock);
 EXPORT_SYMBOL_GPL(nl_table_lock);
 static atomic_t nl_table_users = ATOMIC_INIT(0);
 
 #define nl_deref_protected(X) rcu_dereference_protected(X, lockdep_is_held(&nl_table_lock));
 
+/* Protects netlink socket hash table mutations */
+DEFINE_MUTEX(nl_sk_hash_lock);
+EXPORT_SYMBOL_GPL(nl_sk_hash_lock);
+
+static int lockdep_nl_sk_hash_is_held(void)
+{
+#ifdef CONFIG_LOCKDEP
+	if (debug_locks)
+		return lockdep_is_held(&nl_sk_hash_lock) || lockdep_is_held(&nl_table_lock);
+#endif
+	return 1;
+}
+
 static ATOMIC_NOTIFIER_HEAD(netlink_chain);
+
+static DEFINE_SPINLOCK(netlink_tap_lock);
+static struct list_head netlink_tap_all __read_mostly;
 
 static inline u32 netlink_group_mask(u32 group)
 {
 	return group ? 1 << (group - 1) : 0;
 }
 
-static inline struct hlist_head *nl_portid_hashfn(struct nl_portid_hash *hash, u32 portid)
+static struct sk_buff *netlink_to_full_skb(const struct sk_buff *skb,
+					   gfp_t gfp_mask)
 {
-	return &hash->table[jhash_1word(portid, hash->rnd) & hash->mask];
+	unsigned int len = skb_end_offset(skb);
+	struct sk_buff *new;
+
+	new = alloc_skb(len, gfp_mask);
+	if (new == NULL)
+		return NULL;
+
+	NETLINK_CB(new).portid = NETLINK_CB(skb).portid;
+	NETLINK_CB(new).dst_group = NETLINK_CB(skb).dst_group;
+	NETLINK_CB(new).creds = NETLINK_CB(skb).creds;
+
+	memcpy(skb_put(new, len), skb->data, len);
+	return new;
+}
+
+int netlink_add_tap(struct netlink_tap *nt)
+{
+	if (unlikely(nt->dev->type != ARPHRD_NETLINK))
+		return -EINVAL;
+
+	spin_lock(&netlink_tap_lock);
+	list_add_rcu(&nt->list, &netlink_tap_all);
+	spin_unlock(&netlink_tap_lock);
+
+	if (nt->module)
+		__module_get(nt->module);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(netlink_add_tap);
+
+static int __netlink_remove_tap(struct netlink_tap *nt)
+{
+	bool found = false;
+	struct netlink_tap *tmp;
+
+	spin_lock(&netlink_tap_lock);
+
+	list_for_each_entry(tmp, &netlink_tap_all, list) {
+		if (nt == tmp) {
+			list_del_rcu(&nt->list);
+			found = true;
+			goto out;
+		}
+	}
+
+	pr_warn("__netlink_remove_tap: %p not found\n", nt);
+out:
+	spin_unlock(&netlink_tap_lock);
+
+	if (found && nt->module)
+		module_put(nt->module);
+
+	return found ? 0 : -ENODEV;
+}
+
+int netlink_remove_tap(struct netlink_tap *nt)
+{
+	int ret;
+
+	ret = __netlink_remove_tap(nt);
+	synchronize_net();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(netlink_remove_tap);
+
+static bool netlink_filter_tap(const struct sk_buff *skb)
+{
+	struct sock *sk = skb->sk;
+
+	/* We take the more conservative approach and
+	 * whitelist socket protocols that may pass.
+	 */
+	switch (sk->sk_protocol) {
+	case NETLINK_ROUTE:
+	case NETLINK_USERSOCK:
+	case NETLINK_SOCK_DIAG:
+	case NETLINK_NFLOG:
+	case NETLINK_XFRM:
+	case NETLINK_FIB_LOOKUP:
+	case NETLINK_NETFILTER:
+	case NETLINK_GENERIC:
+		return true;
+	}
+
+	return false;
+}
+
+static int __netlink_deliver_tap_skb(struct sk_buff *skb,
+				     struct net_device *dev)
+{
+	struct sk_buff *nskb;
+	struct sock *sk = skb->sk;
+	int ret = -ENOMEM;
+
+	if (!net_eq(dev_net(dev), sock_net(sk)))
+		return 0;
+
+	dev_hold(dev);
+
+	if (is_vmalloc_addr(skb->head))
+		nskb = netlink_to_full_skb(skb, GFP_ATOMIC);
+	else
+		nskb = skb_clone(skb, GFP_ATOMIC);
+	if (nskb) {
+		nskb->dev = dev;
+		nskb->protocol = htons((u16) sk->sk_protocol);
+		nskb->pkt_type = netlink_is_kernel(sk) ?
+				 PACKET_KERNEL : PACKET_USER;
+		skb_reset_network_header(nskb);
+		ret = dev_queue_xmit(nskb);
+		if (unlikely(ret > 0))
+			ret = net_xmit_errno(ret);
+	}
+
+	dev_put(dev);
+	return ret;
+}
+
+static void __netlink_deliver_tap(struct sk_buff *skb)
+{
+	int ret;
+	struct netlink_tap *tmp;
+
+	if (!netlink_filter_tap(skb))
+		return;
+
+	list_for_each_entry_rcu(tmp, &netlink_tap_all, list) {
+		ret = __netlink_deliver_tap_skb(skb, tmp->dev);
+		if (unlikely(ret))
+			break;
+	}
+}
+
+static void netlink_deliver_tap(struct sk_buff *skb)
+{
+	rcu_read_lock();
+
+	if (unlikely(!list_empty(&netlink_tap_all)))
+		__netlink_deliver_tap(skb);
+
+	rcu_read_unlock();
+}
+
+static void netlink_deliver_tap_kernel(struct sock *dst, struct sock *src,
+				       struct sk_buff *skb)
+{
+	if (!(netlink_is_kernel(dst) && netlink_is_kernel(src)))
+		netlink_deliver_tap(skb);
 }
 
 static void netlink_overrun(struct sock *sk)
@@ -134,617 +349,15 @@ static void netlink_rcv_wake(struct sock *sk)
 		wake_up_interruptible(&nlk->wait);
 }
 
-#ifdef CONFIG_NETLINK_MMAP
-static bool netlink_skb_is_mmaped(const struct sk_buff *skb)
-{
-	return NETLINK_CB(skb).flags & NETLINK_SKB_MMAPED;
-}
-
-static bool netlink_rx_is_mmaped(struct sock *sk)
-{
-	return nlk_sk(sk)->rx_ring.pg_vec != NULL;
-}
-
-static bool netlink_tx_is_mmaped(struct sock *sk)
-{
-	return nlk_sk(sk)->tx_ring.pg_vec != NULL;
-}
-
-static __pure struct page *pgvec_to_page(const void *addr)
-{
-	if (is_vmalloc_addr(addr))
-		return vmalloc_to_page(addr);
-	else
-		return virt_to_page(addr);
-}
-
-static void free_pg_vec(void **pg_vec, unsigned int order, unsigned int len)
-{
-	unsigned int i;
-
-	for (i = 0; i < len; i++) {
-		if (pg_vec[i] != NULL) {
-			if (is_vmalloc_addr(pg_vec[i]))
-				vfree(pg_vec[i]);
-			else
-				free_pages((unsigned long)pg_vec[i], order);
-		}
-	}
-	kfree(pg_vec);
-}
-
-static void *alloc_one_pg_vec_page(unsigned long order)
-{
-	void *buffer;
-	gfp_t gfp_flags = GFP_KERNEL | __GFP_COMP | __GFP_ZERO |
-			  __GFP_NOWARN | __GFP_NORETRY;
-
-	buffer = (void *)__get_free_pages(gfp_flags, order);
-	if (buffer != NULL)
-		return buffer;
-
-	buffer = vzalloc((1 << order) * PAGE_SIZE);
-	if (buffer != NULL)
-		return buffer;
-
-	gfp_flags &= ~__GFP_NORETRY;
-	return (void *)__get_free_pages(gfp_flags, order);
-}
-
-static void **alloc_pg_vec(struct netlink_sock *nlk,
-			   struct nl_mmap_req *req, unsigned int order)
-{
-	unsigned int block_nr = req->nm_block_nr;
-	unsigned int i;
-	void **pg_vec, *ptr;
-
-	pg_vec = kcalloc(block_nr, sizeof(void *), GFP_KERNEL);
-	if (pg_vec == NULL)
-		return NULL;
-
-	for (i = 0; i < block_nr; i++) {
-		pg_vec[i] = ptr = alloc_one_pg_vec_page(order);
-		if (pg_vec[i] == NULL)
-			goto err1;
-	}
-
-	return pg_vec;
-err1:
-	free_pg_vec(pg_vec, order, block_nr);
-	return NULL;
-}
-
-
-static void
-__netlink_set_ring(struct sock *sk, struct nl_mmap_req *req, bool tx_ring, void **pg_vec,
-		   unsigned int order)
-{
-	struct netlink_sock *nlk = nlk_sk(sk);
-	struct sk_buff_head *queue;
-	struct netlink_ring *ring;
-
-	queue = tx_ring ? &sk->sk_write_queue : &sk->sk_receive_queue;
-	ring  = tx_ring ? &nlk->tx_ring : &nlk->rx_ring;
-
-	spin_lock_bh(&queue->lock);
-
-	ring->frame_max		= req->nm_frame_nr - 1;
-	ring->head		= 0;
-	ring->frame_size	= req->nm_frame_size;
-	ring->pg_vec_pages	= req->nm_block_size / PAGE_SIZE;
-
-	swap(ring->pg_vec_len, req->nm_block_nr);
-	swap(ring->pg_vec_order, order);
-	swap(ring->pg_vec, pg_vec);
-
-	__skb_queue_purge(queue);
-	spin_unlock_bh(&queue->lock);
-
-	WARN_ON(atomic_read(&nlk->mapped));
-
-	if (pg_vec)
-		free_pg_vec(pg_vec, order, req->nm_block_nr);
-}
-
-static int netlink_set_ring(struct sock *sk, struct nl_mmap_req *req,
-			    bool tx_ring)
-{
-	struct netlink_sock *nlk = nlk_sk(sk);
-	struct netlink_ring *ring;
-	void **pg_vec = NULL;
-	unsigned int order = 0;
-
-	ring  = tx_ring ? &nlk->tx_ring : &nlk->rx_ring;
-
-	if (atomic_read(&nlk->mapped))
-		return -EBUSY;
-	if (atomic_read(&ring->pending))
-		return -EBUSY;
-
-	if (req->nm_block_nr) {
-		if (ring->pg_vec != NULL)
-			return -EBUSY;
-
-		if ((int)req->nm_block_size <= 0)
-			return -EINVAL;
-		if (!IS_ALIGNED(req->nm_block_size, PAGE_SIZE))
-			return -EINVAL;
-		if (req->nm_frame_size < NL_MMAP_HDRLEN)
-			return -EINVAL;
-		if (!IS_ALIGNED(req->nm_frame_size, NL_MMAP_MSG_ALIGNMENT))
-			return -EINVAL;
-
-		ring->frames_per_block = req->nm_block_size /
-					 req->nm_frame_size;
-		if (ring->frames_per_block == 0)
-			return -EINVAL;
-		if (ring->frames_per_block * req->nm_block_nr !=
-		    req->nm_frame_nr)
-			return -EINVAL;
-
-		order = get_order(req->nm_block_size);
-		pg_vec = alloc_pg_vec(nlk, req, order);
-		if (pg_vec == NULL)
-			return -ENOMEM;
-	} else {
-		if (req->nm_frame_nr)
-			return -EINVAL;
-	}
-
-	mutex_lock(&nlk->pg_vec_lock);
-	if (atomic_read(&nlk->mapped) == 0) {
-		__netlink_set_ring(sk, req, tx_ring, pg_vec, order);
-		mutex_unlock(&nlk->pg_vec_lock);
-		return 0;
-	}
-
-	mutex_unlock(&nlk->pg_vec_lock);
-
-	if (pg_vec)
-		free_pg_vec(pg_vec, order, req->nm_block_nr);
-
-	return -EBUSY;
-}
-
-static void netlink_mm_open(struct vm_area_struct *vma)
-{
-	struct file *file = vma->vm_file;
-	struct socket *sock = file->private_data;
-	struct sock *sk = sock->sk;
-
-	if (sk)
-		atomic_inc(&nlk_sk(sk)->mapped);
-}
-
-static void netlink_mm_close(struct vm_area_struct *vma)
-{
-	struct file *file = vma->vm_file;
-	struct socket *sock = file->private_data;
-	struct sock *sk = sock->sk;
-
-	if (sk)
-		atomic_dec(&nlk_sk(sk)->mapped);
-}
-
-static const struct vm_operations_struct netlink_mmap_ops = {
-	.open	= netlink_mm_open,
-	.close	= netlink_mm_close,
-};
-
-static int netlink_mmap(struct file *file, struct socket *sock,
-			struct vm_area_struct *vma)
-{
-	struct sock *sk = sock->sk;
-	struct netlink_sock *nlk = nlk_sk(sk);
-	struct netlink_ring *ring;
-	unsigned long start, size, expected;
-	unsigned int i;
-	int err = -EINVAL;
-
-	if (vma->vm_pgoff)
-		return -EINVAL;
-
-	mutex_lock(&nlk->pg_vec_lock);
-
-	expected = 0;
-	for (ring = &nlk->rx_ring; ring <= &nlk->tx_ring; ring++) {
-		if (ring->pg_vec == NULL)
-			continue;
-		expected += ring->pg_vec_len * ring->pg_vec_pages * PAGE_SIZE;
-	}
-
-	if (expected == 0)
-		goto out;
-
-	size = vma->vm_end - vma->vm_start;
-	if (size != expected)
-		goto out;
-
-	start = vma->vm_start;
-	for (ring = &nlk->rx_ring; ring <= &nlk->tx_ring; ring++) {
-		if (ring->pg_vec == NULL)
-			continue;
-
-		for (i = 0; i < ring->pg_vec_len; i++) {
-			struct page *page;
-			void *kaddr = ring->pg_vec[i];
-			unsigned int pg_num;
-
-			for (pg_num = 0; pg_num < ring->pg_vec_pages; pg_num++) {
-				page = pgvec_to_page(kaddr);
-				err = vm_insert_page(vma, start, page);
-				if (err < 0)
-					goto out;
-				start += PAGE_SIZE;
-				kaddr += PAGE_SIZE;
-			}
-		}
-	}
-
-	atomic_inc(&nlk->mapped);
-	vma->vm_ops = &netlink_mmap_ops;
-	err = 0;
-out:
-	mutex_unlock(&nlk->pg_vec_lock);
-	return err;
-}
-
-static void netlink_frame_flush_dcache(const struct nl_mmap_hdr *hdr, unsigned int nm_len)
-{
-#if ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE == 1
-	struct page *p_start, *p_end;
-
-	/* First page is flushed through netlink_{get,set}_status */
-	p_start = pgvec_to_page(hdr + PAGE_SIZE);
-	p_end   = pgvec_to_page((void *)hdr + NL_MMAP_HDRLEN + nm_len - 1);
-	while (p_start <= p_end) {
-		flush_dcache_page(p_start);
-		p_start++;
-	}
-#endif
-}
-
-static enum nl_mmap_status netlink_get_status(const struct nl_mmap_hdr *hdr)
-{
-	smp_rmb();
-	flush_dcache_page(pgvec_to_page(hdr));
-	return hdr->nm_status;
-}
-
-static void netlink_set_status(struct nl_mmap_hdr *hdr,
-			       enum nl_mmap_status status)
-{
-	smp_mb();
-	hdr->nm_status = status;
-	flush_dcache_page(pgvec_to_page(hdr));
-}
-
-static struct nl_mmap_hdr *
-__netlink_lookup_frame(const struct netlink_ring *ring, unsigned int pos)
-{
-	unsigned int pg_vec_pos, frame_off;
-
-	pg_vec_pos = pos / ring->frames_per_block;
-	frame_off  = pos % ring->frames_per_block;
-
-	return ring->pg_vec[pg_vec_pos] + (frame_off * ring->frame_size);
-}
-
-static struct nl_mmap_hdr *
-netlink_lookup_frame(const struct netlink_ring *ring, unsigned int pos,
-		     enum nl_mmap_status status)
-{
-	struct nl_mmap_hdr *hdr;
-
-	hdr = __netlink_lookup_frame(ring, pos);
-	if (netlink_get_status(hdr) != status)
-		return NULL;
-
-	return hdr;
-}
-
-static struct nl_mmap_hdr *
-netlink_current_frame(const struct netlink_ring *ring,
-		      enum nl_mmap_status status)
-{
-	return netlink_lookup_frame(ring, ring->head, status);
-}
-
-static struct nl_mmap_hdr *
-netlink_previous_frame(const struct netlink_ring *ring,
-		       enum nl_mmap_status status)
-{
-	unsigned int prev;
-
-	prev = ring->head ? ring->head - 1 : ring->frame_max;
-	return netlink_lookup_frame(ring, prev, status);
-}
-
-static void netlink_increment_head(struct netlink_ring *ring)
-{
-	ring->head = ring->head != ring->frame_max ? ring->head + 1 : 0;
-}
-
-static void netlink_forward_ring(struct netlink_ring *ring)
-{
-	unsigned int head = ring->head, pos = head;
-	const struct nl_mmap_hdr *hdr;
-
-	do {
-		hdr = __netlink_lookup_frame(ring, pos);
-		if (hdr->nm_status == NL_MMAP_STATUS_UNUSED)
-			break;
-		if (hdr->nm_status != NL_MMAP_STATUS_SKIP)
-			break;
-		netlink_increment_head(ring);
-	} while (ring->head != head);
-}
-
-static bool netlink_dump_space(struct netlink_sock *nlk)
-{
-	struct netlink_ring *ring = &nlk->rx_ring;
-	struct nl_mmap_hdr *hdr;
-	unsigned int n;
-
-	hdr = netlink_current_frame(ring, NL_MMAP_STATUS_UNUSED);
-	if (hdr == NULL)
-		return false;
-
-	n = ring->head + ring->frame_max / 2;
-	if (n > ring->frame_max)
-		n -= ring->frame_max;
-
-	hdr = __netlink_lookup_frame(ring, n);
-
-	return hdr->nm_status == NL_MMAP_STATUS_UNUSED;
-}
-
-static unsigned int netlink_poll(struct file *file, struct socket *sock,
-				 poll_table *wait)
-{
-	struct sock *sk = sock->sk;
-	struct netlink_sock *nlk = nlk_sk(sk);
-	unsigned int mask;
-	int err;
-
-	if (nlk->rx_ring.pg_vec != NULL) {
-		/* Memory mapped sockets don't call recvmsg(), so flow control
-		 * for dumps is performed here. A dump is allowed to continue
-		 * if at least half the ring is unused.
-		 */
-		while (nlk->cb != NULL && netlink_dump_space(nlk)) {
-			err = netlink_dump(sk);
-			if (err < 0) {
-				sk->sk_err = -err;
-				sk->sk_error_report(sk);
-				break;
-			}
-		}
-		netlink_rcv_wake(sk);
-	}
-
-	mask = datagram_poll(file, sock, wait);
-
-	spin_lock_bh(&sk->sk_receive_queue.lock);
-	if (nlk->rx_ring.pg_vec) {
-		netlink_forward_ring(&nlk->rx_ring);
-		if (!netlink_previous_frame(&nlk->rx_ring, NL_MMAP_STATUS_UNUSED))
-			mask |= POLLIN | POLLRDNORM;
-	}
-	spin_unlock_bh(&sk->sk_receive_queue.lock);
-
-	spin_lock_bh(&sk->sk_write_queue.lock);
-	if (nlk->tx_ring.pg_vec) {
-		if (netlink_current_frame(&nlk->tx_ring, NL_MMAP_STATUS_UNUSED))
-			mask |= POLLOUT | POLLWRNORM;
-	}
-	spin_unlock_bh(&sk->sk_write_queue.lock);
-
-	return mask;
-}
-
-static struct nl_mmap_hdr *netlink_mmap_hdr(struct sk_buff *skb)
-{
-	return (struct nl_mmap_hdr *)(skb->head - NL_MMAP_HDRLEN);
-}
-
-static void netlink_ring_setup_skb(struct sk_buff *skb, struct sock *sk,
-				   struct netlink_ring *ring,
-				   struct nl_mmap_hdr *hdr)
-{
-	unsigned int size;
-	void *data;
-
-	size = ring->frame_size - NL_MMAP_HDRLEN;
-	data = (void *)hdr + NL_MMAP_HDRLEN;
-
-	skb->head	= data;
-	skb->data	= data;
-	skb_reset_tail_pointer(skb);
-	skb->end	= skb->tail + size;
-	skb->len	= 0;
-
-	skb->destructor	= netlink_skb_destructor;
-	NETLINK_CB(skb).flags |= NETLINK_SKB_MMAPED;
-	NETLINK_CB(skb).sk = sk;
-}
-
-static int netlink_mmap_sendmsg(struct sock *sk, struct msghdr *msg,
-				u32 dst_portid, u32 dst_group,
-				struct sock_iocb *siocb)
-{
-	struct netlink_sock *nlk = nlk_sk(sk);
-	struct netlink_ring *ring;
-	struct nl_mmap_hdr *hdr;
-	struct sk_buff *skb;
-	unsigned int maxlen;
-	int err = 0, len = 0;
-
-	mutex_lock(&nlk->pg_vec_lock);
-
-	ring   = &nlk->tx_ring;
-	maxlen = ring->frame_size - NL_MMAP_HDRLEN;
-
-	do {
-		unsigned int nm_len;
-
-		hdr = netlink_current_frame(ring, NL_MMAP_STATUS_VALID);
-		if (hdr == NULL) {
-			if (!(msg->msg_flags & MSG_DONTWAIT) &&
-			    atomic_read(&nlk->tx_ring.pending))
-				schedule();
-			continue;
-		}
-
-		nm_len = ACCESS_ONCE(hdr->nm_len);
-		if (nm_len > maxlen) {
-			err = -EINVAL;
-			goto out;
-		}
-
-		netlink_frame_flush_dcache(hdr, nm_len);
-
-		skb = alloc_skb(nm_len, GFP_KERNEL);
-		if (skb == NULL) {
-			err = -ENOBUFS;
-			goto out;
-		}
-		__skb_put(skb, nm_len);
-		memcpy(skb->data, (void *)hdr + NL_MMAP_HDRLEN, nm_len);
-		netlink_set_status(hdr, NL_MMAP_STATUS_UNUSED);
-
-		netlink_increment_head(ring);
-
-		NETLINK_CB(skb).portid	  = nlk->portid;
-		NETLINK_CB(skb).dst_group = dst_group;
-		NETLINK_CB(skb).creds	  = siocb->scm->creds;
-
-		err = security_netlink_send(sk, skb);
-		if (err) {
-			kfree_skb(skb);
-			goto out;
-		}
-
-		if (unlikely(dst_group)) {
-			atomic_inc(&skb->users);
-			netlink_broadcast(sk, skb, dst_portid, dst_group,
-					  GFP_KERNEL);
-		}
-		err = netlink_unicast(sk, skb, dst_portid,
-				      msg->msg_flags & MSG_DONTWAIT);
-		if (err < 0)
-			goto out;
-		len += err;
-
-	} while (hdr != NULL ||
-		 (!(msg->msg_flags & MSG_DONTWAIT) &&
-		  atomic_read(&nlk->tx_ring.pending)));
-
-	if (len > 0)
-		err = len;
-out:
-	mutex_unlock(&nlk->pg_vec_lock);
-	return err;
-}
-
-static void netlink_queue_mmaped_skb(struct sock *sk, struct sk_buff *skb)
-{
-	struct nl_mmap_hdr *hdr;
-
-	hdr = netlink_mmap_hdr(skb);
-	hdr->nm_len	= skb->len;
-	hdr->nm_group	= NETLINK_CB(skb).dst_group;
-	hdr->nm_pid	= NETLINK_CB(skb).creds.pid;
-	hdr->nm_uid	= from_kuid(sk_user_ns(sk), NETLINK_CB(skb).creds.uid);
-	hdr->nm_gid	= from_kgid(sk_user_ns(sk), NETLINK_CB(skb).creds.gid);
-	netlink_frame_flush_dcache(hdr, hdr->nm_len);
-	netlink_set_status(hdr, NL_MMAP_STATUS_VALID);
-
-	NETLINK_CB(skb).flags |= NETLINK_SKB_DELIVERED;
-	kfree_skb(skb);
-}
-
-static void netlink_ring_set_copied(struct sock *sk, struct sk_buff *skb)
-{
-	struct netlink_sock *nlk = nlk_sk(sk);
-	struct netlink_ring *ring = &nlk->rx_ring;
-	struct nl_mmap_hdr *hdr;
-
-	spin_lock_bh(&sk->sk_receive_queue.lock);
-	hdr = netlink_current_frame(ring, NL_MMAP_STATUS_UNUSED);
-	if (hdr == NULL) {
-		spin_unlock_bh(&sk->sk_receive_queue.lock);
-		kfree_skb(skb);
-		netlink_overrun(sk);
-		return;
-	}
-	netlink_increment_head(ring);
-	__skb_queue_tail(&sk->sk_receive_queue, skb);
-	spin_unlock_bh(&sk->sk_receive_queue.lock);
-
-	hdr->nm_len	= skb->len;
-	hdr->nm_group	= NETLINK_CB(skb).dst_group;
-	hdr->nm_pid	= NETLINK_CB(skb).creds.pid;
-	hdr->nm_uid	= from_kuid(sk_user_ns(sk), NETLINK_CB(skb).creds.uid);
-	hdr->nm_gid	= from_kgid(sk_user_ns(sk), NETLINK_CB(skb).creds.gid);
-	netlink_set_status(hdr, NL_MMAP_STATUS_COPY);
-}
-
-#else /* CONFIG_NETLINK_MMAP */
-#define netlink_skb_is_mmaped(skb)	false
-#define netlink_rx_is_mmaped(sk)	false
-#define netlink_tx_is_mmaped(sk)	false
-#define netlink_mmap			sock_no_mmap
-#define netlink_poll			datagram_poll
-#define netlink_mmap_sendmsg(sk, msg, dst_portid, dst_group, siocb)	0
-#endif /* CONFIG_NETLINK_MMAP */
-
-static void netlink_destroy_callback(struct netlink_callback *cb)
-{
-	kfree_skb(cb->skb);
-	kfree(cb);
-}
-
-static void netlink_consume_callback(struct netlink_callback *cb)
-{
-	consume_skb(cb->skb);
-	kfree(cb);
-}
-
 static void netlink_skb_destructor(struct sk_buff *skb)
 {
-#ifdef CONFIG_NETLINK_MMAP
-	struct nl_mmap_hdr *hdr;
-	struct netlink_ring *ring;
-	struct sock *sk;
-
-	/* If a packet from the kernel to userspace was freed because of an
-	 * error without being delivered to userspace, the kernel must reset
-	 * the status. In the direction userspace to kernel, the status is
-	 * always reset here after the packet was processed and freed.
-	 */
-	if (netlink_skb_is_mmaped(skb)) {
-		hdr = netlink_mmap_hdr(skb);
-		sk = NETLINK_CB(skb).sk;
-
-		if (NETLINK_CB(skb).flags & NETLINK_SKB_TX) {
-			netlink_set_status(hdr, NL_MMAP_STATUS_UNUSED);
-			ring = &nlk_sk(sk)->tx_ring;
-		} else {
-			if (!(NETLINK_CB(skb).flags & NETLINK_SKB_DELIVERED)) {
-				hdr->nm_len = 0;
-				netlink_set_status(hdr, NL_MMAP_STATUS_VALID);
-			}
-			ring = &nlk_sk(sk)->rx_ring;
-		}
-
-		WARN_ON(atomic_read(&ring->pending) == 0);
-		atomic_dec(&ring->pending);
-		sock_put(sk);
+	if (is_vmalloc_addr(skb->head)) {
+		if (!skb->cloned ||
+		    !atomic_dec_return(&(skb_shinfo(skb)->dataref)))
+			vfree(skb->head);
 
 		skb->head = NULL;
 	}
-#endif
 	if (skb->sk != NULL)
 		sock_rfree(skb);
 }
@@ -762,27 +375,15 @@ static void netlink_sock_destruct(struct sock *sk)
 {
 	struct netlink_sock *nlk = nlk_sk(sk);
 
-	if (nlk->cb) {
-		if (nlk->cb->done)
-			nlk->cb->done(nlk->cb);
+	if (nlk->cb_running) {
+		if (nlk->cb.done)
+			nlk->cb.done(&nlk->cb);
 
-		module_put(nlk->cb->module);
-		netlink_destroy_callback(nlk->cb);
+		module_put(nlk->cb.module);
+		kfree_skb(nlk->cb.skb);
 	}
 
 	skb_queue_purge(&sk->sk_receive_queue);
-#ifdef CONFIG_NETLINK_MMAP
-	if (1) {
-		struct nl_mmap_req req;
-
-		memset(&req, 0, sizeof(req));
-		if (nlk->rx_ring.pg_vec)
-			__netlink_set_ring(sk, &req, false, NULL, 0);
-		memset(&req, 0, sizeof(req));
-		if (nlk->tx_ring.pg_vec)
-			__netlink_set_ring(sk, &req, true, NULL, 0);
-	}
-#endif /* CONFIG_NETLINK_MMAP */
 
 	if (!sock_flag(sk, SOCK_DEAD)) {
 		printk(KERN_ERR "Freeing alive netlink socket %p\n", sk);
@@ -849,98 +450,47 @@ netlink_unlock_table(void)
 		wake_up(&nl_table_wait);
 }
 
+struct netlink_compare_arg
+{
+	struct net *net;
+	u32 portid;
+};
+
+static bool netlink_compare(void *ptr, void *arg)
+{
+	struct netlink_compare_arg *x = arg;
+	struct sock *sk = ptr;
+
+	return nlk_sk(sk)->portid == x->portid &&
+	       net_eq(sock_net(sk), x->net);
+}
+
+static struct sock *__netlink_lookup(struct netlink_table *table, u32 portid,
+				     struct net *net)
+{
+	struct netlink_compare_arg arg = {
+		.net = net,
+		.portid = portid,
+	};
+
+	return rhashtable_lookup_compare(&table->hash, &portid,
+					 &netlink_compare, &arg);
+}
+
 static struct sock *netlink_lookup(struct net *net, int protocol, u32 portid)
 {
-	struct nl_portid_hash *hash = &nl_table[protocol].hash;
-	struct hlist_head *head;
+	struct netlink_table *table = &nl_table[protocol];
 	struct sock *sk;
 
 	read_lock(&nl_table_lock);
-	head = nl_portid_hashfn(hash, portid);
-	sk_for_each(sk, head) {
-		if (net_eq(sock_net(sk), net) && (nlk_sk(sk)->portid == portid)) {
-			sock_hold(sk);
-			goto found;
-		}
-	}
-	sk = NULL;
-found:
+	rcu_read_lock();
+	sk = __netlink_lookup(table, portid, net);
+	if (sk)
+		sock_hold(sk);
+	rcu_read_unlock();
 	read_unlock(&nl_table_lock);
+
 	return sk;
-}
-
-static struct hlist_head *nl_portid_hash_zalloc(size_t size)
-{
-	if (size <= PAGE_SIZE)
-		return kzalloc(size, GFP_ATOMIC);
-	else
-		return (struct hlist_head *)
-			__get_free_pages(GFP_ATOMIC | __GFP_ZERO,
-					 get_order(size));
-}
-
-static void nl_portid_hash_free(struct hlist_head *table, size_t size)
-{
-	if (size <= PAGE_SIZE)
-		kfree(table);
-	else
-		free_pages((unsigned long)table, get_order(size));
-}
-
-static int nl_portid_hash_rehash(struct nl_portid_hash *hash, int grow)
-{
-	unsigned int omask, mask, shift;
-	size_t osize, size;
-	struct hlist_head *otable, *table;
-	int i;
-
-	omask = mask = hash->mask;
-	osize = size = (mask + 1) * sizeof(*table);
-	shift = hash->shift;
-
-	if (grow) {
-		if (++shift > hash->max_shift)
-			return 0;
-		mask = mask * 2 + 1;
-		size *= 2;
-	}
-
-	table = nl_portid_hash_zalloc(size);
-	if (!table)
-		return 0;
-
-	otable = hash->table;
-	hash->table = table;
-	hash->mask = mask;
-	hash->shift = shift;
-	get_random_bytes(&hash->rnd, sizeof(hash->rnd));
-
-	for (i = 0; i <= omask; i++) {
-		struct sock *sk;
-		struct hlist_node *tmp;
-
-		sk_for_each_safe(sk, tmp, &otable[i])
-			__sk_add_node(sk, nl_portid_hashfn(hash, nlk_sk(sk)->portid));
-	}
-
-	nl_portid_hash_free(otable, osize);
-	hash->rehash_time = jiffies + 10 * 60 * HZ;
-	return 1;
-}
-
-static inline int nl_portid_hash_dilute(struct nl_portid_hash *hash, int len)
-{
-	int avg = hash->entries >> hash->shift;
-
-	if (unlikely(avg > 1) && nl_portid_hash_rehash(hash, 1))
-		return 1;
-
-	if (unlikely(len > avg) && time_after(jiffies, hash->rehash_time)) {
-		nl_portid_hash_rehash(hash, 0);
-		return 1;
-	}
-
-	return 0;
 }
 
 static const struct proto_ops netlink_ops;
@@ -971,21 +521,11 @@ netlink_update_listeners(struct sock *sk)
 
 static int netlink_insert(struct sock *sk, struct net *net, u32 portid)
 {
-	struct nl_portid_hash *hash = &nl_table[sk->sk_protocol].hash;
-	struct hlist_head *head;
+	struct netlink_table *table = &nl_table[sk->sk_protocol];
 	int err = -EADDRINUSE;
-	struct sock *osk;
-	int len;
 
-	netlink_table_grab();
-	head = nl_portid_hashfn(hash, portid);
-	len = 0;
-	sk_for_each(osk, head) {
-		if (net_eq(sock_net(osk), net) && (nlk_sk(osk)->portid == portid))
-			break;
-		len++;
-	}
-	if (osk)
+	mutex_lock(&nl_sk_hash_lock);
+	if (__netlink_lookup(table, portid, net))
 		goto err;
 
 	err = -EBUSY;
@@ -993,26 +533,31 @@ static int netlink_insert(struct sock *sk, struct net *net, u32 portid)
 		goto err;
 
 	err = -ENOMEM;
-	if (BITS_PER_LONG > 32 && unlikely(hash->entries >= UINT_MAX))
+	if (BITS_PER_LONG > 32 && unlikely(table->hash.nelems >= UINT_MAX))
 		goto err;
 
-	if (len && nl_portid_hash_dilute(hash, len))
-		head = nl_portid_hashfn(hash, portid);
-	hash->entries++;
 	nlk_sk(sk)->portid = portid;
-	sk_add_node(sk, head);
+	sock_hold(sk);
+	rhashtable_insert(&table->hash, &nlk_sk(sk)->node, GFP_KERNEL);
 	err = 0;
-
 err:
-	netlink_table_ungrab();
+	mutex_unlock(&nl_sk_hash_lock);
 	return err;
 }
 
 static void netlink_remove(struct sock *sk)
 {
+	struct netlink_table *table;
+
+	mutex_lock(&nl_sk_hash_lock);
+	table = &nl_table[sk->sk_protocol];
+	if (rhashtable_remove(&table->hash, &nlk_sk(sk)->node, GFP_KERNEL)) {
+		WARN_ON(atomic_read(&sk->sk_refcnt) == 1);
+		__sock_put(sk);
+	}
+	mutex_unlock(&nl_sk_hash_lock);
+
 	netlink_table_grab();
-	if (sk_del_node_init(sk))
-		nl_table[sk->sk_protocol].hash.entries--;
 	if (nlk_sk(sk)->subscriptions)
 		__sk_del_bind_node(sk);
 	netlink_table_ungrab();
@@ -1044,11 +589,11 @@ static int __netlink_create(struct net *net, struct socket *sock,
 	} else {
 		nlk->cb_mutex = &nlk->cb_def_mutex;
 		mutex_init(nlk->cb_mutex);
+		lockdep_set_class_and_name(nlk->cb_mutex,
+					   nlk_cb_mutex_keys + protocol,
+					   nlk_cb_mutex_key_strings[protocol]);
 	}
 	init_waitqueue_head(&nlk->wait);
-#ifdef CONFIG_NETLINK_MMAP
-	mutex_init(&nlk->pg_vec_lock);
-#endif
 
 	sk->sk_destruct = netlink_sock_destruct;
 	sk->sk_protocol = protocol;
@@ -1061,7 +606,8 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 	struct module *module = NULL;
 	struct mutex *cb_mutex;
 	struct netlink_sock *nlk;
-	void (*bind)(int group);
+	int (*bind)(int group);
+	void (*unbind)(int group);
 	int err = 0;
 
 	sock->state = SS_UNCONNECTED;
@@ -1087,6 +633,7 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 		err = -EPROTONOSUPPORT;
 	cb_mutex = nl_table[protocol].cb_mutex;
 	bind = nl_table[protocol].bind;
+	unbind = nl_table[protocol].unbind;
 	netlink_unlock_table();
 
 	if (err < 0)
@@ -1103,6 +650,7 @@ static int netlink_create(struct net *net, struct socket *sock, int protocol,
 	nlk = nlk_sk(sock->sk);
 	nlk->module = module;
 	nlk->netlink_bind = bind;
+	nlk->netlink_unbind = unbind;
 out:
 	return err;
 
@@ -1156,6 +704,7 @@ static int netlink_release(struct socket *sock)
 			kfree_rcu(old, rcu);
 			nl_table[sk->sk_protocol].module = NULL;
 			nl_table[sk->sk_protocol].bind = NULL;
+			nl_table[sk->sk_protocol].unbind = NULL;
 			nl_table[sk->sk_protocol].flags = 0;
 			nl_table[sk->sk_protocol].registered = 0;
 		}
@@ -1178,9 +727,7 @@ static int netlink_autobind(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
 	struct net *net = sock_net(sk);
-	struct nl_portid_hash *hash = &nl_table[sk->sk_protocol].hash;
-	struct hlist_head *head;
-	struct sock *osk;
+	struct netlink_table *table = &nl_table[sk->sk_protocol];
 	s32 portid = task_tgid_vnr(current);
 	int err;
 	static s32 rover = -4097;
@@ -1188,19 +735,17 @@ static int netlink_autobind(struct socket *sock)
 retry:
 	cond_resched();
 	netlink_table_grab();
-	head = nl_portid_hashfn(hash, portid);
-	sk_for_each(osk, head) {
-		if (!net_eq(sock_net(osk), net))
-			continue;
-		if (nlk_sk(osk)->portid == portid) {
-			/* Bind collision, search negative portid values. */
-			portid = rover--;
-			if (rover > -4097)
-				rover = -4097;
-			netlink_table_ungrab();
-			goto retry;
-		}
+	rcu_read_lock();
+	if (__netlink_lookup(table, portid, net)) {
+		/* Bind collision, search negative portid values. */
+		portid = rover--;
+		if (rover > -4097)
+			rover = -4097;
+		rcu_read_unlock();
+		netlink_table_ungrab();
+		goto retry;
 	}
+	rcu_read_unlock();
 	netlink_table_ungrab();
 
 	err = netlink_insert(sk, net, portid);
@@ -1332,6 +877,19 @@ static int netlink_realloc_groups(struct sock *sk)
 	return err;
 }
 
+static void netlink_unbind(int group, long unsigned int groups,
+			   struct netlink_sock *nlk)
+{
+	int undo;
+
+	if (!nlk->netlink_unbind)
+		return;
+
+	for (undo = 0; undo < group; undo++)
+		if (test_bit(undo, &groups))
+			nlk->netlink_unbind(undo);
+}
+
 static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 			int addr_len)
 {
@@ -1340,6 +898,7 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 	struct netlink_sock *nlk = nlk_sk(sk);
 	struct sockaddr_nl *nladdr = (struct sockaddr_nl *)addr;
 	int err;
+	long unsigned int groups = nladdr->nl_groups;
 
 	if (addr_len < sizeof(struct sockaddr_nl))
 		return -EINVAL;
@@ -1348,7 +907,7 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 		return -EINVAL;
 
 	/* Only superuser is allowed to listen multicasts */
-	if (nladdr->nl_groups) {
+	if (groups) {
 		if (!netlink_allowed(sock, NL_CFG_F_NONROOT_RECV))
 			return -EPERM;
 		err = netlink_realloc_groups(sk);
@@ -1356,36 +915,44 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 			return err;
 	}
 
-	if (nlk->portid) {
+	if (nlk->portid)
 		if (nladdr->nl_pid != nlk->portid)
 			return -EINVAL;
-	} else {
+
+	if (nlk->netlink_bind && groups) {
+		int group;
+
+		for (group = 0; group < nlk->ngroups; group++) {
+			if (!test_bit(group, &groups))
+				continue;
+			err = nlk->netlink_bind(group);
+			if (!err)
+				continue;
+			netlink_unbind(group, groups, nlk);
+			return err;
+		}
+	}
+
+	if (!nlk->portid) {
 		err = nladdr->nl_pid ?
 			netlink_insert(sk, net, nladdr->nl_pid) :
 			netlink_autobind(sock);
-		if (err)
+		if (err) {
+			netlink_unbind(nlk->ngroups, groups, nlk);
 			return err;
+		}
 	}
 
-	if (!nladdr->nl_groups && (nlk->groups == NULL || !(u32)nlk->groups[0]))
+	if (!groups && (nlk->groups == NULL || !(u32)nlk->groups[0]))
 		return 0;
 
 	netlink_table_grab();
 	netlink_update_subscriptions(sk, nlk->subscriptions +
-					 hweight32(nladdr->nl_groups) -
+					 hweight32(groups) -
 					 hweight32(nlk->groups[0]));
-	nlk->groups[0] = (nlk->groups[0] & ~0xffffffffUL) | nladdr->nl_groups;
+	nlk->groups[0] = (nlk->groups[0] & ~0xffffffffUL) | groups;
 	netlink_update_listeners(sk);
 	netlink_table_ungrab();
-
-	if (nlk->netlink_bind && nlk->groups[0]) {
-		int i;
-
-		for (i=0; i<nlk->ngroups; i++) {
-			if (test_bit(i, nlk->groups))
-				nlk->netlink_bind(i);
-		}
-	}
 
 	return 0;
 }
@@ -1410,8 +977,11 @@ static int netlink_connect(struct socket *sock, struct sockaddr *addr,
 	if (addr->sa_family != AF_NETLINK)
 		return -EINVAL;
 
-	/* Only superuser is allowed to send multicasts */
-	if (nladdr->nl_groups && !netlink_allowed(sock, NL_CFG_F_NONROOT_SEND))
+	if (alen < sizeof(struct sockaddr_nl))
+		return -EINVAL;
+
+	if ((nladdr->nl_groups || nladdr->nl_pid) &&
+	    !netlink_allowed(sock, NL_CFG_F_NONROOT_SEND))
 		return -EPERM;
 
 	if (!nlk->portid)
@@ -1482,6 +1052,31 @@ struct sock *netlink_getsockbyfilp(struct file *filp)
 	return sock;
 }
 
+static struct sk_buff *netlink_alloc_large_skb(unsigned int size,
+					       int broadcast)
+{
+	struct sk_buff *skb;
+	void *data;
+
+	if (size <= NLMSG_GOODSIZE || broadcast)
+		return alloc_skb(size, GFP_KERNEL);
+
+	size = SKB_DATA_ALIGN(size) +
+	       SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+
+	data = vmalloc(size);
+	if (data == NULL)
+		return NULL;
+
+	skb = __build_skb(data, size);
+	if (skb == NULL)
+		vfree(data);
+	else
+		skb->destructor = netlink_skb_destructor;
+
+	return skb;
+}
+
 /*
  * Attach a skb to a netlink socket.
  * The caller must hold a reference to the destination socket. On error, the
@@ -1499,9 +1094,8 @@ int netlink_attachskb(struct sock *sk, struct sk_buff *skb,
 
 	nlk = nlk_sk(sk);
 
-	if ((atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf ||
-	     test_bit(NETLINK_CONGESTED, &nlk->state)) &&
-	    !netlink_skb_is_mmaped(skb)) {
+	if (atomic_read(&sk->sk_rmem_alloc) > sk->sk_rcvbuf ||
+	    test_bit(NETLINK_CONGESTED, &nlk->state)) {
 		DECLARE_WAITQUEUE(wait, current);
 		if (!*timeo) {
 			if (!ssk || netlink_is_kernel(ssk))
@@ -1537,15 +1131,10 @@ static int __netlink_sendskb(struct sock *sk, struct sk_buff *skb)
 {
 	int len = skb->len;
 
-#ifdef CONFIG_NETLINK_MMAP
-	if (netlink_skb_is_mmaped(skb))
-		netlink_queue_mmaped_skb(sk, skb);
-	else if (netlink_rx_is_mmaped(sk))
-		netlink_ring_set_copied(sk, skb);
-	else
-#endif /* CONFIG_NETLINK_MMAP */
-		skb_queue_tail(&sk->sk_receive_queue, skb);
-	sk->sk_data_ready(sk, len);
+	netlink_deliver_tap(skb);
+
+	skb_queue_tail(&sk->sk_receive_queue, skb);
+	sk->sk_data_ready(sk);
 	return len;
 }
 
@@ -1568,11 +1157,8 @@ static struct sk_buff *netlink_trim(struct sk_buff *skb, gfp_t allocation)
 	int delta;
 
 	WARN_ON(skb->sk != NULL);
-	if (netlink_skb_is_mmaped(skb))
-		return skb;
-
 	delta = skb->end - skb->tail;
-	if (delta * 2 < skb->truesize)
+	if (is_vmalloc_addr(skb->head) || delta * 2 < skb->truesize)
 		return skb;
 
 	if (skb_shared(skb)) {
@@ -1600,6 +1186,7 @@ static int netlink_unicast_kernel(struct sock *sk, struct sk_buff *skb,
 		ret = skb->len;
 		netlink_skb_set_owner_r(skb, sk);
 		NETLINK_CB(skb).sk = ssk;
+		netlink_deliver_tap_kernel(sk, ssk, skb);
 		nlk->netlink_rcv(skb);
 		consume_skb(skb);
 	} else {
@@ -1648,62 +1235,6 @@ EXPORT_SYMBOL(netlink_unicast);
 struct sk_buff *netlink_alloc_skb(struct sock *ssk, unsigned int size,
 				  u32 dst_portid, gfp_t gfp_mask)
 {
-#ifdef CONFIG_NETLINK_MMAP
-	struct sock *sk = NULL;
-	struct sk_buff *skb;
-	struct netlink_ring *ring;
-	struct nl_mmap_hdr *hdr;
-	unsigned int maxlen;
-
-	sk = netlink_getsockbyportid(ssk, dst_portid);
-	if (IS_ERR(sk))
-		goto out;
-
-	ring = &nlk_sk(sk)->rx_ring;
-	/* fast-path without atomic ops for common case: non-mmaped receiver */
-	if (ring->pg_vec == NULL)
-		goto out_put;
-
-	skb = alloc_skb_head(gfp_mask);
-	if (skb == NULL)
-		goto err1;
-
-	spin_lock_bh(&sk->sk_receive_queue.lock);
-	/* check again under lock */
-	if (ring->pg_vec == NULL)
-		goto out_free;
-
-	maxlen = ring->frame_size - NL_MMAP_HDRLEN;
-	if (maxlen < size)
-		goto out_free;
-
-	netlink_forward_ring(ring);
-	hdr = netlink_current_frame(ring, NL_MMAP_STATUS_UNUSED);
-	if (hdr == NULL)
-		goto err2;
-	netlink_ring_setup_skb(skb, sk, ring, hdr);
-	netlink_set_status(hdr, NL_MMAP_STATUS_RESERVED);
-	atomic_inc(&ring->pending);
-	netlink_increment_head(ring);
-
-	spin_unlock_bh(&sk->sk_receive_queue.lock);
-	return skb;
-
-err2:
-	kfree_skb(skb);
-	spin_unlock_bh(&sk->sk_receive_queue.lock);
-	netlink_overrun(sk);
-err1:
-	sock_put(sk);
-	return NULL;
-
-out_free:
-	kfree_skb(skb);
-	spin_unlock_bh(&sk->sk_receive_queue.lock);
-out_put:
-	sock_put(sk);
-out:
-#endif
 	return alloc_skb(size, gfp_mask);
 }
 EXPORT_SYMBOL_GPL(netlink_alloc_skb);
@@ -1755,25 +1286,25 @@ struct netlink_broadcast_data {
 	void *tx_data;
 };
 
-static int do_one_broadcast(struct sock *sk,
-				   struct netlink_broadcast_data *p)
+static void do_one_broadcast(struct sock *sk,
+				    struct netlink_broadcast_data *p)
 {
 	struct netlink_sock *nlk = nlk_sk(sk);
 	int val;
 
 	if (p->exclude_sk == sk)
-		goto out;
+		return;
 
 	if (nlk->portid == p->portid || p->group - 1 >= nlk->ngroups ||
 	    !test_bit(p->group - 1, nlk->groups))
-		goto out;
+		return;
 
 	if (!net_eq(sock_net(sk), p->net))
-		goto out;
+		return;
 
 	if (p->failure) {
 		netlink_overrun(sk);
-		goto out;
+		return;
 	}
 
 	sock_hold(sk);
@@ -1811,9 +1342,6 @@ static int do_one_broadcast(struct sock *sk,
 		p->skb2 = NULL;
 	}
 	sock_put(sk);
-
-out:
-	return 0;
 }
 
 int netlink_broadcast_filtered(struct sock *ssk, struct sk_buff *skb, u32 portid,
@@ -1912,7 +1440,7 @@ out:
  * netlink_set_err - report error to broadcast listeners
  * @ssk: the kernel netlink socket, as returned by netlink_kernel_create()
  * @portid: the PORTID of a process that we want to skip (if any)
- * @groups: the broadcast group that will notice the error
+ * @group: the broadcast group that will notice the error
  * @code: error code, must be negative (as usual in kernelspace)
  *
  * This function returns the number of broadcast listeners that have set the
@@ -1968,8 +1496,7 @@ static int netlink_setsockopt(struct socket *sock, int level, int optname,
 	if (level != SOL_NETLINK)
 		return -ENOPROTOOPT;
 
-	if (optname != NETLINK_RX_RING && optname != NETLINK_TX_RING &&
-	    optlen >= sizeof(int) &&
+	if (optlen >= sizeof(int) &&
 	    get_user(val, (unsigned int __user *)optval))
 		return -EFAULT;
 
@@ -1990,13 +1517,17 @@ static int netlink_setsockopt(struct socket *sock, int level, int optname,
 			return err;
 		if (!val || val - 1 >= nlk->ngroups)
 			return -EINVAL;
+		if (optname == NETLINK_ADD_MEMBERSHIP && nlk->netlink_bind) {
+			err = nlk->netlink_bind(val);
+			if (err)
+				return err;
+		}
 		netlink_table_grab();
 		netlink_update_socket_mc(nlk, val,
 					 optname == NETLINK_ADD_MEMBERSHIP);
 		netlink_table_ungrab();
-
-		if (nlk->netlink_bind)
-			nlk->netlink_bind(val);
+		if (optname == NETLINK_DROP_MEMBERSHIP && nlk->netlink_unbind)
+			nlk->netlink_unbind(val);
 
 		err = 0;
 		break;
@@ -2018,25 +1549,6 @@ static int netlink_setsockopt(struct socket *sock, int level, int optname,
 		}
 		err = 0;
 		break;
-#ifdef CONFIG_NETLINK_MMAP
-	case NETLINK_RX_RING:
-	case NETLINK_TX_RING: {
-		struct nl_mmap_req req;
-
-		/* Rings might consume more memory than queue limits, require
-		 * CAP_NET_ADMIN.
-		 */
-		if (!capable(CAP_NET_ADMIN))
-			return -EPERM;
-		if (optlen < sizeof(req))
-			return -EINVAL;
-		if (copy_from_user(&req, optval, sizeof(req)))
-			return -EFAULT;
-		err = netlink_set_ring(sk, &req,
-				       optname == NETLINK_TX_RING);
-		break;
-	}
-#endif /* CONFIG_NETLINK_MMAP */
 	default:
 		err = -ENOPROTOOPT;
 	}
@@ -2109,7 +1621,7 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 	struct sock_iocb *siocb = kiocb_to_siocb(kiocb);
 	struct sock *sk = sock->sk;
 	struct netlink_sock *nlk = nlk_sk(sk);
-	struct sockaddr_nl *addr = msg->msg_name;
+	DECLARE_SOCKADDR(struct sockaddr_nl *, addr, msg->msg_name);
 	u32 dst_portid;
 	u32 dst_group;
 	struct sk_buff *skb;
@@ -2129,6 +1641,8 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 
 	if (msg->msg_namelen) {
 		err = -EINVAL;
+		if (msg->msg_namelen < sizeof(struct sockaddr_nl))
+			goto out;
 		if (addr->nl_family != AF_NETLINK)
 			goto out;
 		dst_portid = addr->nl_pid;
@@ -2149,18 +1663,11 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 			goto out;
 	}
 
-	if (netlink_tx_is_mmaped(sk) &&
-	    msg->msg_iov->iov_base == NULL) {
-		err = netlink_mmap_sendmsg(sk, msg, dst_portid, dst_group,
-					   siocb);
-		goto out;
-	}
-
 	err = -EMSGSIZE;
 	if (len > sk->sk_sndbuf - 32)
 		goto out;
 	err = -ENOBUFS;
-	skb = alloc_skb(len, GFP_KERNEL);
+	skb = netlink_alloc_large_skb(len, dst_group);
 	if (skb == NULL)
 		goto out;
 
@@ -2233,6 +1740,11 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 	}
 #endif
 
+	/* Record the max length of recvmsg() calls for future allocations */
+	nlk->max_recvmsg_len = max(nlk->max_recvmsg_len, len);
+	nlk->max_recvmsg_len = min_t(size_t, nlk->max_recvmsg_len,
+				     SKB_WITH_OVERHEAD(32768));
+
 	copied = data_skb->len;
 	if (len < copied) {
 		msg->msg_flags |= MSG_TRUNC;
@@ -2243,7 +1755,7 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 	err = skb_copy_datagram_iovec(data_skb, 0, msg->msg_iov, copied);
 
 	if (msg->msg_name) {
-		struct sockaddr_nl *addr = (struct sockaddr_nl *)msg->msg_name;
+		DECLARE_SOCKADDR(struct sockaddr_nl *, addr, msg->msg_name);
 		addr->nl_family = AF_NETLINK;
 		addr->nl_pad    = 0;
 		addr->nl_pid	= NETLINK_CB(skb).portid;
@@ -2264,7 +1776,8 @@ static int netlink_recvmsg(struct kiocb *kiocb, struct socket *sock,
 
 	skb_free_datagram(sk, skb);
 
-	if (nlk->cb && atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf / 2) {
+	if (nlk->cb_running &&
+	    atomic_read(&sk->sk_rmem_alloc) <= sk->sk_rcvbuf / 2) {
 		ret = netlink_dump(sk);
 		if (ret) {
 			sk->sk_err = -ret;
@@ -2278,7 +1791,7 @@ out:
 	return err ? : copied;
 }
 
-static void netlink_data_ready(struct sock *sk, int len)
+static void netlink_data_ready(struct sock *sk)
 {
 	BUG();
 }
@@ -2347,7 +1860,10 @@ __netlink_kernel_create(struct net *net, int unit, struct module *module,
 		nl_table[unit].module = module;
 		if (cfg) {
 			nl_table[unit].bind = cfg->bind;
+			nl_table[unit].unbind = cfg->unbind;
 			nl_table[unit].flags = cfg->flags;
+			if (cfg->compare)
+				nl_table[unit].compare = cfg->compare;
 		}
 		nl_table[unit].registered = 1;
 	} else {
@@ -2430,28 +1946,13 @@ void __netlink_clear_multicast_users(struct sock *ksk, unsigned int group)
 		netlink_update_socket_mc(nlk_sk(sk), group, 0);
 }
 
-/**
- * netlink_clear_multicast_users - kick off multicast listeners
- *
- * This function removes all listeners from the given group.
- * @ksk: The kernel netlink socket, as returned by
- *	netlink_kernel_create().
- * @group: The multicast group to clear.
- */
-void netlink_clear_multicast_users(struct sock *ksk, unsigned int group)
-{
-	netlink_table_grab();
-	__netlink_clear_multicast_users(ksk, group);
-	netlink_table_ungrab();
-}
-
 struct nlmsghdr *
 __nlmsg_put(struct sk_buff *skb, u32 portid, u32 seq, int type, int len, int flags)
 {
 	struct nlmsghdr *nlh;
 	int size = nlmsg_msg_size(len);
 
-	nlh = (struct nlmsghdr*)skb_put(skb, NLMSG_ALIGN(size));
+	nlh = (struct nlmsghdr *)skb_put(skb, NLMSG_ALIGN(size));
 	nlh->nlmsg_type = type;
 	nlh->nlmsg_len = size;
 	nlh->nlmsg_flags = flags;
@@ -2474,30 +1975,50 @@ static int netlink_dump(struct sock *sk)
 	struct netlink_callback *cb;
 	struct sk_buff *skb = NULL;
 	struct nlmsghdr *nlh;
-	int len, err = -ENOBUFS;
+	struct module *module;
+	int err = -ENOBUFS;
 	int alloc_size;
 
 	mutex_lock(nlk->cb_mutex);
-
-	cb = nlk->cb;
-	if (cb == NULL) {
+	if (!nlk->cb_running) {
 		err = -EINVAL;
 		goto errout_skb;
 	}
 
+	cb = &nlk->cb;
 	alloc_size = max_t(int, cb->min_dump_alloc, NLMSG_GOODSIZE);
 
-	if (!netlink_rx_is_mmaped(sk) &&
-	    atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf)
+	if (atomic_read(&sk->sk_rmem_alloc) >= sk->sk_rcvbuf)
 		goto errout_skb;
-	skb = netlink_alloc_skb(sk, alloc_size, nlk->portid, GFP_KERNEL);
+
+	/* NLMSG_GOODSIZE is small to avoid high order allocations being
+	 * required, but it makes sense to _attempt_ a 16K bytes allocation
+	 * to reduce number of system calls on dump operations, if user
+	 * ever provided a big enough buffer.
+	 */
+	if (alloc_size < nlk->max_recvmsg_len) {
+		skb = netlink_alloc_skb(sk,
+					nlk->max_recvmsg_len,
+					nlk->portid,
+					(GFP_KERNEL & ~__GFP_WAIT) |
+					__GFP_NOWARN | __GFP_NORETRY);
+		/* available room should be exact amount to avoid MSG_TRUNC */
+		if (skb)
+			skb_reserve(skb, skb_tailroom(skb) -
+					 nlk->max_recvmsg_len);
+	}
+	if (!skb)
+		skb = netlink_alloc_skb(sk, alloc_size, nlk->portid,
+					(GFP_KERNEL & ~__GFP_WAIT));
 	if (!skb)
 		goto errout_skb;
 	netlink_skb_set_owner_r(skb, sk);
 
-	len = cb->dump(skb, cb);
+	if (nlk->dump_done_errno > 0)
+		nlk->dump_done_errno = cb->dump(skb, cb);
 
-	if (len > 0) {
+	if (nlk->dump_done_errno > 0 ||
+	    skb_tailroom(skb) < nlmsg_total_size(sizeof(nlk->dump_done_errno))) {
 		mutex_unlock(nlk->cb_mutex);
 
 		if (sk_filter(sk, skb))
@@ -2507,13 +2028,15 @@ static int netlink_dump(struct sock *sk)
 		return 0;
 	}
 
-	nlh = nlmsg_put_answer(skb, cb, NLMSG_DONE, sizeof(len), NLM_F_MULTI);
-	if (!nlh)
+	nlh = nlmsg_put_answer(skb, cb, NLMSG_DONE,
+			       sizeof(nlk->dump_done_errno), NLM_F_MULTI);
+	if (WARN_ON(!nlh))
 		goto errout_skb;
 
 	nl_dump_check_consistent(cb, nlh);
 
-	memcpy(nlmsg_data(nlh), &len, sizeof(len));
+	memcpy(nlmsg_data(nlh), &nlk->dump_done_errno,
+	       sizeof(nlk->dump_done_errno));
 
 	if (sk_filter(sk, skb))
 		kfree_skb(skb);
@@ -2522,11 +2045,13 @@ static int netlink_dump(struct sock *sk)
 
 	if (cb->done)
 		cb->done(cb);
-	nlk->cb = NULL;
-	mutex_unlock(nlk->cb_mutex);
 
-	module_put(cb->module);
-	netlink_consume_callback(cb);
+	nlk->cb_running = false;
+	module = cb->module;
+	skb = cb->skb;
+	mutex_unlock(nlk->cb_mutex);
+	module_put(module);
+	consume_skb(skb);
 	return 0;
 
 errout_skb:
@@ -2544,23 +2069,30 @@ int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 	struct netlink_sock *nlk;
 	int ret;
 
-	cb = kzalloc(sizeof(*cb), GFP_KERNEL);
-	if (cb == NULL)
-		return -ENOBUFS;
+	atomic_inc(&skb->users);
 
-	/* Memory mapped dump requests need to be copied to avoid looping
-	 * on the pending state in netlink_mmap_sendmsg() while the CB hold
-	 * a reference to the skb.
-	 */
-	if (netlink_skb_is_mmaped(skb)) {
-		skb = skb_copy(skb, GFP_KERNEL);
-		if (skb == NULL) {
-			kfree(cb);
-			return -ENOBUFS;
-		}
-	} else
-		atomic_inc(&skb->users);
+	sk = netlink_lookup(sock_net(ssk), ssk->sk_protocol, NETLINK_CB(skb).portid);
+	if (sk == NULL) {
+		ret = -ECONNREFUSED;
+		goto error_free;
+	}
 
+	nlk = nlk_sk(sk);
+	mutex_lock(nlk->cb_mutex);
+	/* A dump is in progress... */
+	if (nlk->cb_running) {
+		ret = -EBUSY;
+		goto error_unlock;
+	}
+	/* add reference of module which cb->dump belongs to */
+	if (!try_module_get(control->module)) {
+		ret = -EPROTONOSUPPORT;
+		goto error_unlock;
+	}
+
+	cb = &nlk->cb;
+	memset(cb, 0, sizeof(*cb));
+	cb->start = control->start;
 	cb->dump = control->dump;
 	cb->done = control->done;
 	cb->nlh = nlh;
@@ -2569,34 +2101,15 @@ int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 	cb->min_dump_alloc = control->min_dump_alloc;
 	cb->skb = skb;
 
-	sk = netlink_lookup(sock_net(ssk), ssk->sk_protocol, NETLINK_CB(skb).portid);
-	if (sk == NULL) {
-		netlink_destroy_callback(cb);
-		return -ECONNREFUSED;
-	}
-	nlk = nlk_sk(sk);
+	nlk->cb_running = true;
+	nlk->dump_done_errno = INT_MAX;
 
-	mutex_lock(nlk->cb_mutex);
-	/* A dump is in progress... */
-	if (nlk->cb) {
-		mutex_unlock(nlk->cb_mutex);
-		netlink_destroy_callback(cb);
-		ret = -EBUSY;
-		goto out;
-	}
-	/* add reference of module which cb->dump belongs to */
-	if (!try_module_get(cb->module)) {
-		mutex_unlock(nlk->cb_mutex);
-		netlink_destroy_callback(cb);
-		ret = -EPROTONOSUPPORT;
-		goto out;
-	}
-
-	nlk->cb = cb;
 	mutex_unlock(nlk->cb_mutex);
 
+	if (cb->start)
+		cb->start(cb);
+
 	ret = netlink_dump(sk);
-out:
 	sock_put(sk);
 
 	if (ret)
@@ -2606,6 +2119,13 @@ out:
 	 * signal not to send ACK even if it was requested.
 	 */
 	return -EINTR;
+
+error_unlock:
+	sock_put(sk);
+	mutex_unlock(nlk->cb_mutex);
+error_free:
+	kfree_skb(skb);
+	return ret;
 }
 EXPORT_SYMBOL(__netlink_dump_start);
 
@@ -2737,14 +2257,18 @@ static struct sock *netlink_seq_socket_idx(struct seq_file *seq, loff_t pos)
 {
 	struct nl_seq_iter *iter = seq->private;
 	int i, j;
+	struct netlink_sock *nlk;
 	struct sock *s;
 	loff_t off = 0;
 
 	for (i = 0; i < MAX_LINKS; i++) {
-		struct nl_portid_hash *hash = &nl_table[i].hash;
+		struct rhashtable *ht = &nl_table[i].hash;
+		const struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
 
-		for (j = 0; j <= hash->mask; j++) {
-			sk_for_each(s, &hash->table[j]) {
+		for (j = 0; j < tbl->size; j++) {
+			rht_for_each_entry_rcu(nlk, tbl->buckets[j], node) {
+				s = (struct sock *)nlk;
+
 				if (sock_net(s) != seq_file_net(seq))
 					continue;
 				if (off == pos) {
@@ -2760,16 +2284,19 @@ static struct sock *netlink_seq_socket_idx(struct seq_file *seq, loff_t pos)
 }
 
 static void *netlink_seq_start(struct seq_file *seq, loff_t *pos)
-	__acquires(nl_table_lock)
+	__acquires(nl_table_lock) __acquires(RCU)
 {
 	read_lock(&nl_table_lock);
+	rcu_read_lock();
 	return *pos ? netlink_seq_socket_idx(seq, *pos - 1) : SEQ_START_TOKEN;
 }
 
 static void *netlink_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
-	struct sock *s;
+	struct rhashtable *ht;
+	struct netlink_sock *nlk;
 	struct nl_seq_iter *iter;
+	struct net *net;
 	int i, j;
 
 	++*pos;
@@ -2777,28 +2304,28 @@ static void *netlink_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 	if (v == SEQ_START_TOKEN)
 		return netlink_seq_socket_idx(seq, 0);
 
+	net = seq_file_net(seq);
 	iter = seq->private;
-	s = v;
-	do {
-		s = sk_next(s);
-	} while (s && sock_net(s) != seq_file_net(seq));
-	if (s)
-		return s;
+	nlk = v;
 
 	i = iter->link;
+	ht = &nl_table[i].hash;
+	rht_for_each_entry(nlk, nlk->node.next, ht, node)
+		if (net_eq(sock_net((struct sock *)nlk), net))
+			return nlk;
+
 	j = iter->hash_idx + 1;
 
 	do {
-		struct nl_portid_hash *hash = &nl_table[i].hash;
+		const struct bucket_table *tbl = rht_dereference_rcu(ht->tbl, ht);
 
-		for (; j <= hash->mask; j++) {
-			s = sk_head(&hash->table[j]);
-			while (s && sock_net(s) != seq_file_net(seq))
-				s = sk_next(s);
-			if (s) {
-				iter->link = i;
-				iter->hash_idx = j;
-				return s;
+		for (; j < tbl->size; j++) {
+			rht_for_each_entry(nlk, tbl->buckets[j], ht, node) {
+				if (net_eq(sock_net((struct sock *)nlk), net)) {
+					iter->link = i;
+					iter->hash_idx = j;
+					return nlk;
+				}
 			}
 		}
 
@@ -2809,8 +2336,9 @@ static void *netlink_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 }
 
 static void netlink_seq_stop(struct seq_file *seq, void *v)
-	__releases(nl_table_lock)
+	__releases(RCU) __releases(nl_table_lock)
 {
+	rcu_read_unlock();
 	read_unlock(&nl_table_lock);
 }
 
@@ -2825,14 +2353,14 @@ static int netlink_seq_show(struct seq_file *seq, void *v)
 		struct sock *s = v;
 		struct netlink_sock *nlk = nlk_sk(s);
 
-		seq_printf(seq, "%pK %-3d %-6u %08x %-8d %-8d %pK %-8d %-8d %-8lu\n",
+		seq_printf(seq, "%pK %-3d %-6u %08x %-8d %-8d %d %-8d %-8d %-8lu\n",
 			   s,
 			   s->sk_protocol,
 			   nlk->portid,
 			   nlk->groups ? (u32)nlk->groups[0] : 0,
 			   sk_rmem_alloc_get(s),
 			   sk_wmem_alloc_get(s),
-			   nlk->cb,
+			   nlk->cb_running,
 			   atomic_read(&s->sk_refcnt),
 			   atomic_read(&s->sk_drops),
 			   sock_i_ino(s)
@@ -2887,7 +2415,7 @@ static const struct proto_ops netlink_ops = {
 	.socketpair =	sock_no_socketpair,
 	.accept =	sock_no_accept,
 	.getname =	netlink_getname,
-	.poll =		netlink_poll,
+	.poll =		datagram_poll,
 	.ioctl =	sock_no_ioctl,
 	.listen =	sock_no_listen,
 	.shutdown =	sock_no_shutdown,
@@ -2895,7 +2423,7 @@ static const struct proto_ops netlink_ops = {
 	.getsockopt =	netlink_getsockopt,
 	.sendmsg =	netlink_sendmsg,
 	.recvmsg =	netlink_recvmsg,
-	.mmap =		netlink_mmap,
+	.mmap =		sock_no_mmap,
 	.sendpage =	sock_no_sendpage,
 };
 
@@ -2949,9 +2477,17 @@ static struct pernet_operations __net_initdata netlink_net_ops = {
 static int __init netlink_proto_init(void)
 {
 	int i;
-	unsigned long limit;
-	unsigned int order;
 	int err = proto_register(&netlink_proto, 0);
+	struct rhashtable_params ht_params = {
+		.head_offset = offsetof(struct netlink_sock, node),
+		.key_offset = offsetof(struct netlink_sock, portid),
+		.key_len = sizeof(u32), /* portid */
+		.hashfn = jhash,
+		.max_shift = 16, /* 64K */
+		.grow_decision = rht_grow_above_75,
+		.shrink_decision = rht_shrink_below_30,
+		.mutex_is_held = lockdep_nl_sk_hash_is_held,
+	};
 
 	if (err != 0)
 		goto out;
@@ -2962,31 +2498,16 @@ static int __init netlink_proto_init(void)
 	if (!nl_table)
 		goto panic;
 
-	if (totalram_pages >= (128 * 1024))
-		limit = totalram_pages >> (21 - PAGE_SHIFT);
-	else
-		limit = totalram_pages >> (23 - PAGE_SHIFT);
-
-	order = get_bitmask_order(limit) - 1 + PAGE_SHIFT;
-	limit = (1UL << order) / sizeof(struct hlist_head);
-	order = get_bitmask_order(min(limit, (unsigned long)UINT_MAX)) - 1;
-
 	for (i = 0; i < MAX_LINKS; i++) {
-		struct nl_portid_hash *hash = &nl_table[i].hash;
-
-		hash->table = nl_portid_hash_zalloc(1 * sizeof(*hash->table));
-		if (!hash->table) {
-			while (i-- > 0)
-				nl_portid_hash_free(nl_table[i].hash.table,
-						 1 * sizeof(*hash->table));
+		if (rhashtable_init(&nl_table[i].hash, &ht_params) < 0) {
+			while (--i > 0)
+				rhashtable_destroy(&nl_table[i].hash);
 			kfree(nl_table);
 			goto panic;
 		}
-		hash->max_shift = order;
-		hash->shift = 0;
-		hash->mask = 0;
-		hash->rehash_time = jiffies;
 	}
+
+	INIT_LIST_HEAD(&netlink_tap_all);
 
 	netlink_add_usersock_entry();
 

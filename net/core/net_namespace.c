@@ -24,7 +24,7 @@
 
 static LIST_HEAD(pernet_list);
 static struct list_head *first_device = &pernet_list;
-static DEFINE_MUTEX(net_mutex);
+DEFINE_MUTEX(net_mutex);
 
 LIST_HEAD(net_namespace_list);
 EXPORT_SYMBOL_GPL(net_namespace_list);
@@ -188,6 +188,25 @@ out_undo:
 	goto out;
 }
 
+static int __net_init net_defaults_init_net(struct net *net)
+{
+	net->core.sysctl_somaxconn = SOMAXCONN;
+	return 0;
+}
+
+static struct pernet_operations net_defaults_ops = {
+	.init = net_defaults_init_net,
+};
+
+static __init int net_defaults_init(void)
+{
+	if (register_pernet_subsys(&net_defaults_ops))
+		panic("Cannot initialize net default settings");
+
+	return 0;
+}
+
+core_initcall(net_defaults_init);
 
 #ifdef CONFIG_NET_NS
 static struct kmem_cache *net_cachep;
@@ -224,7 +243,7 @@ static void net_free(struct net *net)
 		return;
 	}
 #endif
-	kfree(net->gen);
+	kfree(rcu_access_pointer(net->gen));
 	kmem_cache_free(net_cachep, net);
 }
 
@@ -273,7 +292,7 @@ static void cleanup_net(struct work_struct *work)
 {
 	const struct pernet_operations *ops;
 	struct net *net, *tmp;
-	LIST_HEAD(net_kill_list);
+	struct list_head net_kill_list;
 	LIST_HEAD(net_exit_list);
 
 	/* Atomically snapshot the list of namespaces to cleanup */
@@ -373,9 +392,11 @@ struct net *get_net_ns_by_pid(pid_t pid)
 	tsk = find_task_by_vpid(pid);
 	if (tsk) {
 		struct nsproxy *nsproxy;
-		nsproxy = task_nsproxy(tsk);
+		task_lock(tsk);
+		nsproxy = tsk->nsproxy;
 		if (nsproxy)
 			net = get_net(nsproxy->net_ns);
+		task_unlock(tsk);
 	}
 	rcu_read_unlock();
 	return net;
@@ -632,11 +653,11 @@ static void *netns_get(struct task_struct *task)
 	struct net *net = NULL;
 	struct nsproxy *nsproxy;
 
-	rcu_read_lock();
-	nsproxy = task_nsproxy(task);
+	task_lock(task);
+	nsproxy = task->nsproxy;
 	if (nsproxy)
 		net = get_net(nsproxy->net_ns);
-	rcu_read_unlock();
+	task_unlock(task);
 
 	return net;
 }
@@ -651,7 +672,7 @@ static int netns_install(struct nsproxy *nsproxy, void *ns)
 	struct net *net = ns;
 
 	if (!ns_capable(net->user_ns, CAP_SYS_ADMIN) ||
-	    !nsown_capable(CAP_SYS_ADMIN))
+	    !ns_capable(current_user_ns(), CAP_SYS_ADMIN))
 		return -EPERM;
 
 	put_net(nsproxy->net_ns);

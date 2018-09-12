@@ -25,8 +25,7 @@
  *     GNU General Public License for more details.
  *
  *     You should have received a copy of the GNU General Public License
- *     along with this program; if not, write to the Free Software Foundation,
- *     Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+ *     along with this program; if not, see <http://www.gnu.org/licenses/>.
  *
  ****************************************************************/
 
@@ -46,7 +45,6 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -1011,6 +1009,7 @@ static int kaweth_probe(
 	struct net_device *netdev;
 	const eth_addr_t bcast_addr = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 	int result = 0;
+	int rv = -EIO;
 
 	dev_dbg(dev,
 		"Kawasaki Device Probe (Device number:%d): 0x%4.4x:0x%4.4x:0x%4.4x\n",
@@ -1051,6 +1050,10 @@ static int kaweth_probe(
 		/* Download the firmware */
 		dev_info(dev, "Downloading firmware...\n");
 		kaweth->firmware_buf = (__u8 *)__get_free_page(GFP_KERNEL);
+		if (!kaweth->firmware_buf) {
+			rv = -ENOMEM;
+			goto err_free_netdev;
+		}
 		if ((result = kaweth_download_firmware(kaweth,
 						      "kaweth/new_code.bin",
 						      100,
@@ -1172,7 +1175,7 @@ err_fw:
 	netdev->netdev_ops = &kaweth_netdev_ops;
 	netdev->watchdog_timeo = KAWETH_TX_TIMEOUT;
 	netdev->mtu = le16_to_cpu(kaweth->configuration.segment_size);
-	SET_ETHTOOL_OPS(netdev, &ops);
+	netdev->ethtool_ops = &ops;
 
 	/* kaweth is zeroed as part of alloc_netdev */
 	INIT_DELAYED_WORK(&kaweth->lowmem_work, kaweth_resubmit_tl);
@@ -1211,7 +1214,7 @@ err_only_tx:
 err_free_netdev:
 	free_netdev(netdev);
 
-	return -EIO;
+	return rv;
 }
 
 /****************************************************************

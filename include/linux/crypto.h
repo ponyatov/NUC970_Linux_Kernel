@@ -354,7 +354,6 @@ struct ablkcipher_tfm {
 
 	unsigned int ivsize;
 	unsigned int reqsize;
-	bool has_setkey;
 };
 
 struct aead_tfm {
@@ -665,13 +664,6 @@ static inline int crypto_ablkcipher_setkey(struct crypto_ablkcipher *tfm,
 	return crt->setkey(crt->base, key, keylen);
 }
 
-static inline bool crypto_ablkcipher_has_setkey(struct crypto_ablkcipher *tfm)
-{
-	struct ablkcipher_tfm *crt = crypto_ablkcipher_crt(tfm);
-
-	return crt->has_setkey;
-}
-
 static inline struct crypto_ablkcipher *crypto_ablkcipher_reqtfm(
 	struct ablkcipher_request *req)
 {
@@ -731,9 +723,9 @@ static inline void ablkcipher_request_free(struct ablkcipher_request *req)
 
 static inline void ablkcipher_request_set_callback(
 	struct ablkcipher_request *req,
-	u32 flags, crypto_completion_t complete, void *data)
+	u32 flags, crypto_completion_t compl, void *data)
 {
-	req->base.complete = complete;
+	req->base.complete = compl;
 	req->base.data = data;
 	req->base.flags = flags;
 }
@@ -862,10 +854,10 @@ static inline void aead_request_free(struct aead_request *req)
 
 static inline void aead_request_set_callback(struct aead_request *req,
 					     u32 flags,
-					     crypto_completion_t complete,
+					     crypto_completion_t compl,
 					     void *data)
 {
-	req->base.complete = complete;
+	req->base.complete = compl;
 	req->base.data = data;
 	req->base.flags = flags;
 }

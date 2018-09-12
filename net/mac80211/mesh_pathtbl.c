@@ -287,8 +287,10 @@ static void mesh_path_move_to_queue(struct mesh_path *gate_mpath,
 	struct sk_buff_head failq;
 	unsigned long flags;
 
-	BUG_ON(gate_mpath == from_mpath);
-	BUG_ON(!gate_mpath->next_hop);
+	if (WARN_ON(gate_mpath == from_mpath))
+		return;
+	if (WARN_ON(!gate_mpath->next_hop))
+		return;
 
 	__skb_queue_head_init(&failq);
 
@@ -722,13 +724,12 @@ void mesh_plink_broken(struct sta_info *sta)
 	struct mpath_node *node;
 	struct ieee80211_sub_if_data *sdata = sta->sdata;
 	int i;
-	__le16 reason = cpu_to_le16(WLAN_REASON_MESH_PATH_DEST_UNREACHABLE);
 
 	rcu_read_lock();
 	tbl = rcu_dereference(mesh_paths);
 	for_each_mesh_entry(tbl, node, i) {
 		mpath = node->mpath;
-		if (rcu_dereference(mpath->next_hop) == sta &&
+		if (rcu_access_pointer(mpath->next_hop) == sta &&
 		    mpath->flags & MESH_PATH_ACTIVE &&
 		    !(mpath->flags & MESH_PATH_FIXED)) {
 			spin_lock_bh(&mpath->state_lock);
@@ -736,9 +737,9 @@ void mesh_plink_broken(struct sta_info *sta)
 			++mpath->sn;
 			spin_unlock_bh(&mpath->state_lock);
 			mesh_path_error_tx(sdata,
-					   sdata->u.mesh.mshcfg.element_ttl,
-					   mpath->dst, cpu_to_le32(mpath->sn),
-					   reason, bcast);
+				sdata->u.mesh.mshcfg.element_ttl,
+				mpath->dst, mpath->sn,
+				WLAN_REASON_MESH_PATH_DEST_UNREACHABLE, bcast);
 		}
 	}
 	rcu_read_unlock();
@@ -747,8 +748,10 @@ void mesh_plink_broken(struct sta_info *sta)
 static void mesh_path_node_reclaim(struct rcu_head *rp)
 {
 	struct mpath_node *node = container_of(rp, struct mpath_node, rcu);
+	struct ieee80211_sub_if_data *sdata = node->mpath->sdata;
 
 	del_timer_sync(&node->mpath->timer);
+	atomic_dec(&sdata->u.mesh.mpaths);
 	kfree(node->mpath);
 	kfree(node);
 }
@@ -756,9 +759,8 @@ static void mesh_path_node_reclaim(struct rcu_head *rp)
 /* needs to be called with the corresponding hashwlock taken */
 static void __mesh_path_del(struct mesh_table *tbl, struct mpath_node *node)
 {
-	struct mesh_path *mpath = node->mpath;
-	struct ieee80211_sub_if_data *sdata = node->mpath->sdata;
-
+	struct mesh_path *mpath;
+	mpath = node->mpath;
 	spin_lock(&mpath->state_lock);
 	mpath->flags |= MESH_PATH_RESOLVING;
 	if (mpath->is_gate)
@@ -766,7 +768,6 @@ static void __mesh_path_del(struct mesh_table *tbl, struct mpath_node *node)
 	hlist_del_rcu(&node->list);
 	call_rcu(&node->rcu, mesh_path_node_reclaim);
 	spin_unlock(&mpath->state_lock);
-	atomic_dec(&sdata->u.mesh.mpaths);
 	atomic_dec(&tbl->entries);
 }
 
@@ -793,7 +794,7 @@ void mesh_path_flush_by_nexthop(struct sta_info *sta)
 	tbl = resize_dereference_mesh_paths();
 	for_each_mesh_entry(tbl, node, i) {
 		mpath = node->mpath;
-		if (rcu_dereference(mpath->next_hop) == sta) {
+		if (rcu_access_pointer(mpath->next_hop) == sta) {
 			spin_lock(&tbl->hashwlock[i]);
 			__mesh_path_del(tbl, node);
 			spin_unlock(&tbl->hashwlock[i]);

@@ -3,7 +3,7 @@
  *
  * This file contains the generic target mode <-> Linux SCSI subsystem plugin.
  *
- * (c) Copyright 2003-2012 RisingTide Systems LLC.
+ * (c) Copyright 2003-2013 Datera, Inc.
  *
  * Nicholas A. Bellinger <nab@kernel.org>
  *
@@ -313,7 +313,7 @@ static int pscsi_add_device_to_list(struct se_device *dev,
 	if (!sd->queue_depth) {
 		sd->queue_depth = PSCSI_DEFAULT_QUEUEDEPTH;
 
-		pr_err("Set broken SCSI Device %d:%d:%d"
+		pr_err("Set broken SCSI Device %d:%d:%llu"
 			" queue_depth to %d\n", sd->channel, sd->id,
 				sd->lun, sd->queue_depth);
 	}
@@ -321,7 +321,7 @@ static int pscsi_add_device_to_list(struct se_device *dev,
 	dev->dev_attrib.hw_block_size =
 		min_not_zero((int)sd->sector_size, 512);
 	dev->dev_attrib.hw_max_sectors =
-		min_not_zero((unsigned)sd->host->max_sectors, queue_max_hw_sectors(q));
+		min_not_zero(sd->host->max_sectors, queue_max_hw_sectors(q));
 	dev->dev_attrib.hw_queue_depth = sd->queue_depth;
 
 	/*
@@ -379,7 +379,7 @@ static int pscsi_create_type_disk(struct se_device *dev, struct scsi_device *sd)
 	int ret;
 
 	if (scsi_device_get(sd)) {
-		pr_err("scsi_device_get() failed for %d:%d:%d:%d\n",
+		pr_err("scsi_device_get() failed for %d:%d:%d:%llu\n",
 			sh->host_no, sd->channel, sd->id, sd->lun);
 		spin_unlock_irq(sh->host_lock);
 		return -EIO;
@@ -405,7 +405,7 @@ static int pscsi_create_type_disk(struct se_device *dev, struct scsi_device *sd)
 		return ret;
 	}
 
-	pr_debug("CORE_PSCSI[%d] - Added TYPE_DISK for %d:%d:%d:%d\n",
+	pr_debug("CORE_PSCSI[%d] - Added TYPE_DISK for %d:%d:%d:%llu\n",
 		phv->phv_host_id, sh->host_no, sd->channel, sd->id, sd->lun);
 	return 0;
 }
@@ -421,7 +421,7 @@ static int pscsi_create_type_nondisk(struct se_device *dev, struct scsi_device *
 	int ret;
 
 	if (scsi_device_get(sd)) {
-		pr_err("scsi_device_get() failed for %d:%d:%d:%d\n",
+		pr_err("scsi_device_get() failed for %d:%d:%d:%llu\n",
 			sh->host_no, sd->channel, sd->id, sd->lun);
 		spin_unlock_irq(sh->host_lock);
 		return -EIO;
@@ -433,7 +433,7 @@ static int pscsi_create_type_nondisk(struct se_device *dev, struct scsi_device *
 		scsi_device_put(sd);
 		return ret;
 	}
-	pr_debug("CORE_PSCSI[%d] - Added Type: %s for %d:%d:%d:%d\n",
+	pr_debug("CORE_PSCSI[%d] - Added Type: %s for %d:%d:%d:%llu\n",
 		phv->phv_host_id, scsi_device_type(sd->type), sh->host_no,
 		sd->channel, sd->id, sd->lun);
 
@@ -730,14 +730,18 @@ static ssize_t pscsi_set_configfs_dev_params(struct se_device *dev,
 				ret = -EINVAL;
 				goto out;
 			}
-			match_int(args, &arg);
+			ret = match_int(args, &arg);
+			if (ret)
+				goto out;
 			pdv->pdv_host_id = arg;
 			pr_debug("PSCSI[%d]: Referencing SCSI Host ID:"
 				" %d\n", phv->phv_host_id, pdv->pdv_host_id);
 			pdv->pdv_flags |= PDF_HAS_VIRT_HOST_ID;
 			break;
 		case Opt_scsi_channel_id:
-			match_int(args, &arg);
+			ret = match_int(args, &arg);
+			if (ret)
+				goto out;
 			pdv->pdv_channel_id = arg;
 			pr_debug("PSCSI[%d]: Referencing SCSI Channel"
 				" ID: %d\n",  phv->phv_host_id,
@@ -745,7 +749,9 @@ static ssize_t pscsi_set_configfs_dev_params(struct se_device *dev,
 			pdv->pdv_flags |= PDF_HAS_CHANNEL_ID;
 			break;
 		case Opt_scsi_target_id:
-			match_int(args, &arg);
+			ret = match_int(args, &arg);
+			if (ret)
+				goto out;
 			pdv->pdv_target_id = arg;
 			pr_debug("PSCSI[%d]: Referencing SCSI Target"
 				" ID: %d\n", phv->phv_host_id,
@@ -753,7 +759,9 @@ static ssize_t pscsi_set_configfs_dev_params(struct se_device *dev,
 			pdv->pdv_flags |= PDF_HAS_TARGET_ID;
 			break;
 		case Opt_scsi_lun_id:
-			match_int(args, &arg);
+			ret = match_int(args, &arg);
+			if (ret)
+				goto out;
 			pdv->pdv_lun_id = arg;
 			pr_debug("PSCSI[%d]: Referencing SCSI LUN ID:"
 				" %d\n", phv->phv_host_id, pdv->pdv_lun_id);
@@ -1031,12 +1039,13 @@ pscsi_execute_cmd(struct se_cmd *cmd)
 		req = blk_get_request(pdv->pdv_sd->request_queue,
 				(data_direction == DMA_TO_DEVICE),
 				GFP_KERNEL);
-		if (!req || IS_ERR(req)) {
-			pr_err("PSCSI: blk_get_request() failed: %ld\n",
-					req ? IS_ERR(req) : -ENOMEM);
+		if (IS_ERR(req)) {
+			pr_err("PSCSI: blk_get_request() failed\n");
 			ret = TCM_LOGICAL_UNIT_COMMUNICATION_FAILURE;
 			goto fail;
 		}
+
+		blk_rq_set_block_pc(req);
 	} else {
 		BUG_ON(!cmd->data_length);
 
@@ -1053,7 +1062,6 @@ pscsi_execute_cmd(struct se_cmd *cmd)
 		}
 	}
 
-	req->cmd_type = REQ_TYPE_BLOCK_PC;
 	req->end_io = pscsi_req_done;
 	req->end_io_data = cmd;
 	req->cmd_len = scsi_command_size(pt->pscsi_cdb);

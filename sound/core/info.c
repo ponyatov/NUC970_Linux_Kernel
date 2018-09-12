@@ -253,6 +253,7 @@ static ssize_t snd_info_entry_write(struct file *file, const char __user *buffer
 	struct snd_info_buffer *buf;
 	ssize_t size = 0;
 	loff_t pos;
+	unsigned long realloc_size;
 
 	data = file->private_data;
 	if (snd_BUG_ON(!data))
@@ -261,7 +262,8 @@ static ssize_t snd_info_entry_write(struct file *file, const char __user *buffer
 	pos = *offset;
 	if (pos < 0 || (long) pos != pos || (ssize_t) count < 0)
 		return -EIO;
-	if ((unsigned long) pos + (unsigned long) count < (unsigned long) pos)
+	realloc_size = (unsigned long) pos + (unsigned long) count;
+	if (realloc_size < (unsigned long) pos || realloc_size > UINT_MAX)
 		return -EIO;
 	switch (entry->content) {
 	case SNDRV_INFO_CONTENT_TEXT:
@@ -418,9 +420,14 @@ static int snd_info_entry_release(struct inode *inode, struct file *file)
 			if (entry->c.text.write) {
 				entry->c.text.write(entry, data->wbuffer);
 				if (data->wbuffer->error) {
-					snd_printk(KERN_WARNING "data write error to %s (%i)\n",
-						entry->name,
-						data->wbuffer->error);
+					if (entry->card)
+						dev_warn(entry->card->dev, "info: data write error to %s (%i)\n",
+							 entry->name,
+							 data->wbuffer->error);
+					else
+						pr_warn("ALSA: info: data write error to %s (%i)\n",
+							entry->name,
+							data->wbuffer->error);
 				}
 			}
 			kfree(data->wbuffer->buffer);
@@ -540,7 +547,7 @@ int __init snd_info_init(void)
 		snd_oss_root = entry;
 	}
 #endif
-#if defined(CONFIG_SND_SEQUENCER) || defined(CONFIG_SND_SEQUENCER_MODULE)
+#if IS_ENABLED(CONFIG_SND_SEQUENCER)
 	{
 		struct snd_info_entry *entry;
 		if ((entry = snd_info_create_module_entry(THIS_MODULE, "seq", NULL)) == NULL)
@@ -567,7 +574,7 @@ int __exit snd_info_done(void)
 	snd_minor_info_done();
 	snd_info_version_done();
 	if (snd_proc_root) {
-#if defined(CONFIG_SND_SEQUENCER) || defined(CONFIG_SND_SEQUENCER_MODULE)
+#if IS_ENABLED(CONFIG_SND_SEQUENCER)
 		snd_info_free_entry(snd_seq_root);
 #endif
 #ifdef CONFIG_SND_OSSEMUL

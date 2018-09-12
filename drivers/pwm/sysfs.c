@@ -169,15 +169,7 @@ static struct attribute *pwm_attrs[] = {
 	&dev_attr_polarity.attr,
 	NULL
 };
-
-static const struct attribute_group pwm_attr_group = {
-	.attrs		= pwm_attrs,
-};
-
-static const struct attribute_group *pwm_attr_groups[] = {
-	&pwm_attr_group,
-	NULL,
-};
+ATTRIBUTE_GROUPS(pwm);
 
 static void pwm_export_release(struct device *child)
 {
@@ -205,7 +197,7 @@ static int pwm_export_child(struct device *parent, struct pwm_device *pwm)
 	export->child.release = pwm_export_release;
 	export->child.parent = parent;
 	export->child.devt = MKDEV(0, 0);
-	export->child.groups = pwm_attr_groups;
+	export->child.groups = pwm_groups;
 	dev_set_name(&export->child, "pwm%u", pwm->hwpwm);
 
 	ret = device_register(&export->child);
@@ -268,6 +260,7 @@ static ssize_t pwm_export_store(struct device *parent,
 
 	return ret ? : len;
 }
+static DEVICE_ATTR(export, 0200, NULL, pwm_export_store);
 
 static ssize_t pwm_unexport_store(struct device *parent,
 				  struct device_attribute *attr,
@@ -288,27 +281,29 @@ static ssize_t pwm_unexport_store(struct device *parent,
 
 	return ret ? : len;
 }
+static DEVICE_ATTR(unexport, 0200, NULL, pwm_unexport_store);
 
-static ssize_t pwm_npwm_show(struct device *parent,
-			     struct device_attribute *attr,
-			     char *buf)
+static ssize_t npwm_show(struct device *parent, struct device_attribute *attr,
+			 char *buf)
 {
 	const struct pwm_chip *chip = dev_get_drvdata(parent);
 
 	return sprintf(buf, "%u\n", chip->npwm);
 }
+static DEVICE_ATTR_RO(npwm);
 
-static struct device_attribute pwm_chip_attrs[] = {
-	__ATTR(export, 0200, NULL, pwm_export_store),
-	__ATTR(unexport, 0200, NULL, pwm_unexport_store),
-	__ATTR(npwm, 0444, pwm_npwm_show, NULL),
-	__ATTR_NULL,
+static struct attribute *pwm_chip_attrs[] = {
+	&dev_attr_export.attr,
+	&dev_attr_unexport.attr,
+	&dev_attr_npwm.attr,
+	NULL,
 };
+ATTRIBUTE_GROUPS(pwm_chip);
 
 static struct class pwm_class = {
 	.name		= "pwm",
 	.owner		= THIS_MODULE,
-	.dev_attrs	= pwm_chip_attrs,
+	.dev_groups	= pwm_chip_groups,
 };
 
 static int pwmchip_sysfs_match(struct device *parent, const void *data)
@@ -319,6 +314,7 @@ static int pwmchip_sysfs_match(struct device *parent, const void *data)
 void pwmchip_sysfs_export(struct pwm_chip *chip)
 {
 	struct device *parent;
+
 	/*
 	 * If device_create() fails the pwm_chip is still usable by
 	 * the kernel its just not exported.
@@ -344,12 +340,26 @@ void pwmchip_sysfs_unexport(struct pwm_chip *chip)
 	}
 }
 
+void pwmchip_sysfs_unexport_children(struct pwm_chip *chip)
+{
+	struct device *parent;
+	unsigned int i;
+
+	parent = class_find_device(&pwm_class, NULL, chip,
+				   pwmchip_sysfs_match);
+	if (!parent)
+		return;
+
+	for (i = 0; i < chip->npwm; i++) {
+		struct pwm_device *pwm = &chip->pwms[i];
+
+		if (test_bit(PWMF_EXPORTED, &pwm->flags))
+			pwm_unexport_child(parent, pwm);
+	}
+}
+
 static int __init pwm_sysfs_init(void)
 {
 	return class_register(&pwm_class);
 }
-/*
- * Was subsys_initcall() in 3.11, which execute later than static linked pwm driver probe
- * , and thus cause kernel crash. So use core_initcall() instead of subsys_initcall()
- */
-core_initcall(pwm_sysfs_init);
+subsys_initcall(pwm_sysfs_init);

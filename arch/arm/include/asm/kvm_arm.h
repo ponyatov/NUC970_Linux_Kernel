@@ -55,8 +55,10 @@
  * The bits we set in HCR:
  * TAC:		Trap ACTLR
  * TSC:		Trap SMC
+ * TVM:		Trap VM ops (until MMU and caches are on)
  * TSW:		Trap cache operations by set/way
  * TWI:		Trap WFI
+ * TWE:		Trap WFE
  * TIDCP:	Trap L2CTLR/L2ECTLR
  * BSU_IS:	Upgrade barriers to the inner shareable domain
  * FB:		Force broadcast of all maintainance operations
@@ -67,8 +69,7 @@
  */
 #define HCR_GUEST_MASK (HCR_TSC | HCR_TSW | HCR_TWI | HCR_VM | HCR_BSU_IS | \
 			HCR_FB | HCR_TAC | HCR_AMO | HCR_IMO | HCR_FMO | \
-			HCR_SWIO | HCR_TIDCP)
-#define HCR_VIRT_EXCP_MASK (HCR_VA | HCR_VI | HCR_VF)
+			HCR_TVM | HCR_TWE | HCR_SWIO | HCR_TIDCP)
 
 /* System Control Register (SCTLR) bits */
 #define SCTLR_TE	(1 << 30)
@@ -95,12 +96,12 @@
 #define TTBCR_IRGN1	(3 << 24)
 #define TTBCR_EPD1	(1 << 23)
 #define TTBCR_A1	(1 << 22)
-#define TTBCR_T1SZ	(3 << 16)
+#define TTBCR_T1SZ	(7 << 16)
 #define TTBCR_SH0	(3 << 12)
 #define TTBCR_ORGN0	(3 << 10)
 #define TTBCR_IRGN0	(3 << 8)
 #define TTBCR_EPD0	(1 << 7)
-#define TTBCR_T0SZ	3
+#define TTBCR_T0SZ	(7 << 0)
 #define HTCR_MASK	(TTBCR_T0SZ | TTBCR_IRGN0 | TTBCR_ORGN0 | TTBCR_SH0)
 
 /* Hyp System Trap Register */
@@ -135,7 +136,6 @@
 #define KVM_PHYS_MASK	(KVM_PHYS_SIZE - 1ULL)
 #define PTRS_PER_S2_PGD	(1ULL << (KVM_PHYS_SHIFT - 30))
 #define S2_PGD_ORDER	get_order(PTRS_PER_S2_PGD * sizeof(pgd_t))
-#define S2_PGD_SIZE	(1 << S2_PGD_ORDER)
 
 /* Virtualization Translation Control Register (VTCR) bits */
 #define VTCR_SH0	(3 << 12)
@@ -161,8 +161,7 @@
 #else
 #define VTTBR_X		(5 - KVM_T0SZ)
 #endif
-#define VTTBR_BADDR_SHIFT (VTTBR_X - 1)
-#define VTTBR_BADDR_MASK  (((1LLU << (40 - VTTBR_X)) - 1) << VTTBR_BADDR_SHIFT)
+#define VTTBR_BADDR_MASK  (((1LLU << (40 - VTTBR_X)) - 1) << VTTBR_X)
 #define VTTBR_VMID_SHIFT  (48LLU)
 #define VTTBR_VMID_MASK	  (0xffLLU << VTTBR_VMID_SHIFT)
 
@@ -208,6 +207,9 @@
 #define HSR_EC_IABT_HYP	(0x21)
 #define HSR_EC_DABT	(0x24)
 #define HSR_EC_DABT_HYP	(0x25)
+#define HSR_EC_MAX	(0x3f)
+
+#define HSR_WFI_IS_WFE		(1U << 0)
 
 #define HSR_HVC_IMM_MASK	((1UL << 16) - 1)
 

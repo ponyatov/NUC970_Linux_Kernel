@@ -365,7 +365,12 @@ int cx231xx_send_vendor_cmd(struct cx231xx *dev,
 	 */
 	if ((ven_req->wLength > 4) && ((ven_req->bRequest == 0x4) ||
 					(ven_req->bRequest == 0x5) ||
-					(ven_req->bRequest == 0x6))) {
+					(ven_req->bRequest == 0x6) ||
+
+					/* Internal Master 3 Bus can send
+					 * and receive only 4 bytes per time
+					 */
+					(ven_req->bRequest == 0x2))) {
 		unsend_size = 0;
 		pdata = ven_req->pBuff;
 
@@ -723,10 +728,10 @@ int cx231xx_set_mode(struct cx231xx *dev, enum cx231xx_mode set_mode)
 			break;
 		case CX231XX_BOARD_CNXT_RDE_253S:
 		case CX231XX_BOARD_CNXT_RDU_253S:
-		case CX231XX_BOARD_PV_PLAYTV_USB_HYBRID:
 			errCode = cx231xx_set_agc_analog_digital_mux_select(dev, 1);
 			break;
 		case CX231XX_BOARD_HAUPPAUGE_EXETER:
+		case CX231XX_BOARD_HAUPPAUGE_930C_HD_1113xx:
 			errCode = cx231xx_set_power_mode(dev,
 						POLARIS_AVMODE_DIGITAL);
 			break;
@@ -745,10 +750,11 @@ int cx231xx_set_mode(struct cx231xx *dev, enum cx231xx_mode set_mode)
 		case CX231XX_BOARD_CNXT_RDE_253S:
 		case CX231XX_BOARD_CNXT_RDU_253S:
 		case CX231XX_BOARD_HAUPPAUGE_EXETER:
+		case CX231XX_BOARD_HAUPPAUGE_930C_HD_1113xx:
 		case CX231XX_BOARD_PV_PLAYTV_USB_HYBRID:
 		case CX231XX_BOARD_HAUPPAUGE_USB2_FM_PAL:
 		case CX231XX_BOARD_HAUPPAUGE_USB2_FM_NTSC:
-			errCode = cx231xx_set_agc_analog_digital_mux_select(dev, 0);
+		errCode = cx231xx_set_agc_analog_digital_mux_select(dev, 0);
 			break;
 		default:
 			break;
@@ -1380,6 +1386,7 @@ int cx231xx_dev_init(struct cx231xx *dev)
 	case CX231XX_BOARD_CNXT_RDE_253S:
 	case CX231XX_BOARD_CNXT_RDU_253S:
 	case CX231XX_BOARD_HAUPPAUGE_EXETER:
+	case CX231XX_BOARD_HAUPPAUGE_930C_HD_1113xx:
 	case CX231XX_BOARD_PV_PLAYTV_USB_HYBRID:
 	case CX231XX_BOARD_HAUPPAUGE_USB2_FM_PAL:
 	case CX231XX_BOARD_HAUPPAUGE_USB2_FM_NTSC:
@@ -1489,7 +1496,7 @@ int cx231xx_mode_register(struct cx231xx *dev, u16 address, u32 mode)
 	if (status < 0)
 		return status;
 
-	tmp = le32_to_cpu(*((u32 *) value));
+	tmp = le32_to_cpu(*((__le32 *) value));
 	tmp |= mode;
 
 	value[0] = (u8) tmp;

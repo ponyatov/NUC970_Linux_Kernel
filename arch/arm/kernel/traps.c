@@ -19,21 +19,26 @@
 #include <linux/uaccess.h>
 #include <linux/hardirq.h>
 #include <linux/kdebug.h>
+#include <linux/kprobes.h>
 #include <linux/module.h>
 #include <linux/kexec.h>
 #include <linux/bug.h>
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/sched.h>
+#include <linux/irq.h>
 
 #include <linux/atomic.h>
 #include <asm/cacheflush.h>
 #include <asm/exception.h>
 #include <asm/unistd.h>
 #include <asm/traps.h>
+#include <asm/ptrace.h>
 #include <asm/unwind.h>
 #include <asm/tls.h>
 #include <asm/system_misc.h>
+#include <asm/opcodes.h>
+
 
 static const char *handler[]= {
 	"prefetch abort",
@@ -61,7 +66,7 @@ static void dump_mem(const char *, const char *, unsigned long, unsigned long);
 void dump_backtrace_entry(unsigned long where, unsigned long from, unsigned long frame)
 {
 #ifdef CONFIG_KALLSYMS
-	printk("[<%08lx>] (%pS) from [<%08lx>] (%pS)\n", where, (void *)where, from, (void *)from);
+	printk("[<%08lx>] (%ps) from [<%08lx>] (%pS)\n", where, (void *)where, from, (void *)from);
 #else
 	printk("Function entered at [<%08lx>] from [<%08lx>]\n", where, from);
 #endif
@@ -128,30 +133,26 @@ static void dump_mem(const char *lvl, const char *str, unsigned long bottom,
 	set_fs(fs);
 }
 
-static void dump_instr(const char *lvl, struct pt_regs *regs)
+static void __dump_instr(const char *lvl, struct pt_regs *regs)
 {
 	unsigned long addr = instruction_pointer(regs);
 	const int thumb = thumb_mode(regs);
 	const int width = thumb ? 4 : 8;
-	mm_segment_t fs;
 	char str[sizeof("00000000 ") * 5 + 2 + 1], *p = str;
 	int i;
 
 	/*
-	 * We need to switch to kernel mode so that we can use __get_user
-	 * to safely read from kernel space.  Note that we now dump the
-	 * code first, just in case the backtrace kills us.
+	 * Note that we now dump the code first, just in case the backtrace
+	 * kills us.
 	 */
-	fs = get_fs();
-	set_fs(KERNEL_DS);
 
 	for (i = -4; i < 1 + !!thumb; i++) {
 		unsigned int val, bad;
 
 		if (thumb)
-			bad = __get_user(val, &((u16 *)addr)[i]);
+			bad = get_user(val, &((u16 *)addr)[i]);
 		else
-			bad = __get_user(val, &((u32 *)addr)[i]);
+			bad = get_user(val, &((u32 *)addr)[i]);
 
 		if (!bad)
 			p += sprintf(p, i == 0 ? "(%0*x) " : "%0*x ",
@@ -162,8 +163,20 @@ static void dump_instr(const char *lvl, struct pt_regs *regs)
 		}
 	}
 	printk("%sCode: %s\n", lvl, str);
+}
 
-	set_fs(fs);
+static void dump_instr(const char *lvl, struct pt_regs *regs)
+{
+	mm_segment_t fs;
+
+	if (!user_mode(regs)) {
+		fs = get_fs();
+		set_fs(KERNEL_DS);
+		__dump_instr(lvl, regs);
+		set_fs(fs);
+	} else {
+		__dump_instr(lvl, regs);
+	}
 }
 
 #ifdef CONFIG_ARM_UNWIND
@@ -183,7 +196,7 @@ static void dump_backtrace(struct pt_regs *regs, struct task_struct *tsk)
 		tsk = current;
 
 	if (regs) {
-		fp = regs->ARM_fp;
+		fp = frame_pointer(regs);
 		mode = processor_mode(regs);
 	} else if (tsk != current) {
 		fp = thread_saved_fp(tsk);
@@ -383,7 +396,8 @@ void unregister_undef_hook(struct undef_hook *hook)
 	raw_spin_unlock_irqrestore(&undef_lock, flags);
 }
 
-static int call_undef_hook(struct pt_regs *regs, unsigned int instr)
+static nokprobe_inline
+int call_undef_hook(struct pt_regs *regs, unsigned int instr)
 {
 	struct undef_hook *hook;
 	unsigned long flags;
@@ -410,26 +424,30 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 	if (processor_mode(regs) == SVC_MODE) {
 #ifdef CONFIG_THUMB2_KERNEL
 		if (thumb_mode(regs)) {
-			instr = ((u16 *)pc)[0];
+			instr = __mem_to_opcode_thumb16(((u16 *)pc)[0]);
 			if (is_wide_instruction(instr)) {
-				instr <<= 16;
-				instr |= ((u16 *)pc)[1];
+				u16 inst2;
+				inst2 = __mem_to_opcode_thumb16(((u16 *)pc)[1]);
+				instr = __opcode_thumb32_compose(instr, inst2);
 			}
 		} else
 #endif
-			instr = *(u32 *) pc;
+			instr = __mem_to_opcode_arm(*(u32 *) pc);
 	} else if (thumb_mode(regs)) {
 		if (get_user(instr, (u16 __user *)pc))
 			goto die_sig;
+		instr = __mem_to_opcode_thumb16(instr);
 		if (is_wide_instruction(instr)) {
 			unsigned int instr2;
 			if (get_user(instr2, (u16 __user *)pc+1))
 				goto die_sig;
-			instr <<= 16;
-			instr |= instr2;
+			instr2 = __mem_to_opcode_thumb16(instr2);
+			instr = __opcode_thumb32_compose(instr, instr2);
 		}
-	} else if (get_user(instr, (u32 __user *)pc)) {
-		goto die_sig;
+	} else {
+		if (get_user(instr, (u32 __user *)pc))
+			goto die_sig;
+		instr = __mem_to_opcode_arm(instr);
 	}
 
 	if (call_undef_hook(regs, instr) == 0)
@@ -440,6 +458,7 @@ die_sig:
 	if (user_debug & UDBG_UNDEFINED) {
 		printk(KERN_INFO "%s (%d): undefined instruction: pc=%p\n",
 			current->comm, task_pid_nr(current), pc);
+		__show_regs(regs);
 		dump_instr(KERN_INFO, regs);
 	}
 #endif
@@ -451,11 +470,31 @@ die_sig:
 
 	arm_notify_die("Oops - undefined instruction", regs, &info, 0, 6);
 }
+NOKPROBE_SYMBOL(do_undefinstr)
 
-asmlinkage void do_unexp_fiq (struct pt_regs *regs)
+/*
+ * Handle FIQ similarly to NMI on x86 systems.
+ *
+ * The runtime environment for NMIs is extremely restrictive
+ * (NMIs can pre-empt critical sections meaning almost all locking is
+ * forbidden) meaning this default FIQ handling must only be used in
+ * circumstances where non-maskability improves robustness, such as
+ * watchdog or debug logic.
+ *
+ * This handler is not appropriate for general purpose use in drivers
+ * platform code and can be overrideen using set_fiq_handler.
+ */
+asmlinkage void __exception_irq_entry handle_fiq_as_nmi(struct pt_regs *regs)
 {
-	printk("Hmm.  Unexpected FIQ received, but trying to continue\n");
-	printk("You may have a hardware problem...\n");
+	struct pt_regs *old_regs = set_irq_regs(regs);
+
+	nmi_enter();
+
+	/* nop. FIQ handlers for special arch/arm features can be added here. */
+
+	nmi_exit();
+
+	set_irq_regs(old_regs);
 }
 
 /*
@@ -506,27 +545,37 @@ static int bad_syscall(int n, struct pt_regs *regs)
 }
 
 static inline int
+__do_cache_op(unsigned long start, unsigned long end)
+{
+	int ret;
+
+	do {
+		unsigned long chunk = min(PAGE_SIZE, end - start);
+
+		if (fatal_signal_pending(current))
+			return 0;
+
+		ret = flush_cache_user_range(start, start + chunk);
+		if (ret)
+			return ret;
+
+		cond_resched();
+		start += chunk;
+	} while (start < end);
+
+	return 0;
+}
+
+static inline int
 do_cache_op(unsigned long start, unsigned long end, int flags)
 {
-	struct mm_struct *mm = current->active_mm;
-	struct vm_area_struct *vma;
-
 	if (end < start || flags)
 		return -EINVAL;
 
-	down_read(&mm->mmap_sem);
-	vma = find_vma(mm, start);
-	if (vma && vma->vm_start < end) {
-		if (start < vma->vm_start)
-			start = vma->vm_start;
-		if (end > vma->vm_end)
-			end = vma->vm_end;
+	if (!access_ok(VERIFY_READ, start, end - start))
+		return -EFAULT;
 
-		up_read(&mm->mmap_sem);
-		return flush_cache_user_range(start, end);
-	}
-	up_read(&mm->mmap_sem);
-	return -EINVAL;
+	return __do_cache_op(start, end);
 }
 
 /*
@@ -536,7 +585,6 @@ do_cache_op(unsigned long start, unsigned long end, int flags)
 #define NR(x) ((__ARM_NR_##x) - __ARM_NR_BASE)
 asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 {
-	struct thread_info *thread = current_thread_info();
 	siginfo_t info;
 
 	if ((no >> 16) != (__ARM_NR_BASE>> 16))
@@ -587,21 +635,7 @@ asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 		return regs->ARM_r0;
 
 	case NR(set_tls):
-		thread->tp_value = regs->ARM_r0;
-		if (tls_emu)
-			return 0;
-		if (has_tls_reg) {
-			asm ("mcr p15, 0, %0, c13, c0, 3"
-				: : "r" (regs->ARM_r0));
-		} else {
-			/*
-			 * User space must never try to access this directly.
-			 * Expect your app to break eventually if you do so.
-			 * The user helper at 0xffff0fe0 must be used instead.
-			 * (see entry-armv.S for details)
-			 */
-			*((unsigned int *)0xffff0ff0) = regs->ARM_r0;
-		}
+		set_tls(regs->ARM_r0);
 		return 0;
 
 #ifdef CONFIG_NEEDS_SYSCALL_FOR_CMPXCHG
@@ -676,7 +710,7 @@ asmlinkage int arm_syscall(int no, struct pt_regs *regs)
 		dump_instr("", regs);
 		if (user_mode(regs)) {
 			__show_regs(regs);
-			c_backtrace(regs->ARM_fp, processor_mode(regs));
+			c_backtrace(frame_pointer(regs), processor_mode(regs));
 		}
 	}
 #endif
@@ -705,7 +739,7 @@ static int get_tp_trap(struct pt_regs *regs, unsigned int instr)
 	int reg = (instr >> 12) & 15;
 	if (reg == 15)
 		return 1;
-	regs->uregs[reg] = current_thread_info()->tp_value;
+	regs->uregs[reg] = current_thread_info()->tp_value[0];
 	regs->ARM_pc += 4;
 	return 0;
 }
@@ -822,13 +856,14 @@ static void __init kuser_init(void *vectors)
 		memcpy(vectors + 0xfe0, vectors + 0xfe8, 4);
 }
 #else
-static void __init kuser_init(void *vectors)
+static inline void __init kuser_init(void *vectors)
 {
 }
 #endif
 
 void __init early_trap_init(void *vectors_base)
 {
+#ifndef CONFIG_CPU_V7M
 	unsigned long vectors = (unsigned long)vectors_base;
 	extern char __stubs_start[], __stubs_end[];
 	extern char __vectors_start[], __vectors_end[];
@@ -857,4 +892,11 @@ void __init early_trap_init(void *vectors_base)
 
 	flush_icache_range(vectors, vectors + PAGE_SIZE * 2);
 	modify_domain(DOMAIN_USER, DOMAIN_CLIENT);
+#else /* ifndef CONFIG_CPU_V7M */
+	/*
+	 * on V7-M there is no need to copy the vector table to a dedicated
+	 * memory area. The address is configurable and so a table in the kernel
+	 * image can be used.
+	 */
+#endif
 }

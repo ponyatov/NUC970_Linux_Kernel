@@ -1091,7 +1091,7 @@ static int kdb_reboot(int argc, const char **argv)
 static void kdb_dumpregs(struct pt_regs *regs)
 {
 	int old_lvl = console_loglevel;
-	console_loglevel = 15;
+	console_loglevel = CONSOLE_LOGLEVEL_MOTORMOUTH;
 	kdb_trap_printk++;
 	show_regs(regs);
 	kdb_trap_printk--;
@@ -1199,6 +1199,9 @@ static int kdb_local(kdb_reason_t reason, int error, struct pt_regs *regs,
 		kdb_printf("due to oops @ " kdb_machreg_fmt "\n",
 			   instruction_pointer(regs));
 		kdb_dumpregs(regs);
+		break;
+	case KDB_REASON_SYSTEM_NMI:
+		kdb_printf("due to System NonMaskable Interrupt\n");
 		break;
 	case KDB_REASON_NMI:
 		kdb_printf("due to NonMaskable Interrupt @ "
@@ -1521,6 +1524,7 @@ static int kdb_md(int argc, const char **argv)
 	int symbolic = 0;
 	int valid = 0;
 	int phys = 0;
+	int raw = 0;
 
 	kdbgetintenv("MDCOUNT", &mdcount);
 	kdbgetintenv("RADIX", &radix);
@@ -1530,9 +1534,10 @@ static int kdb_md(int argc, const char **argv)
 	repeat = mdcount * 16 / bytesperword;
 
 	if (strcmp(argv[0], "mdr") == 0) {
-		if (argc != 2)
+		if (argc == 2 || (argc == 0 && last_addr != 0))
+			valid = raw = 1;
+		else
 			return KDB_ARGCOUNT;
-		valid = 1;
 	} else if (isdigit(argv[0][2])) {
 		bytesperword = (int)(argv[0][2] - '0');
 		if (bytesperword == 0) {
@@ -1568,7 +1573,10 @@ static int kdb_md(int argc, const char **argv)
 		radix = last_radix;
 		bytesperword = last_bytesperword;
 		repeat = last_repeat;
-		mdcount = ((repeat * bytesperword) + 15) / 16;
+		if (raw)
+			mdcount = repeat;
+		else
+			mdcount = ((repeat * bytesperword) + 15) / 16;
 	}
 
 	if (argc) {
@@ -1585,7 +1593,10 @@ static int kdb_md(int argc, const char **argv)
 			diag = kdbgetularg(argv[nextarg], &val);
 			if (!diag) {
 				mdcount = (int) val;
-				repeat = mdcount * 16 / bytesperword;
+				if (raw)
+					repeat = mdcount;
+				else
+					repeat = mdcount * 16 / bytesperword;
 			}
 		}
 		if (argc >= nextarg+1) {
@@ -1595,8 +1606,15 @@ static int kdb_md(int argc, const char **argv)
 		}
 	}
 
-	if (strcmp(argv[0], "mdr") == 0)
-		return kdb_mdr(addr, mdcount);
+	if (strcmp(argv[0], "mdr") == 0) {
+		int ret;
+		last_addr = addr;
+		ret = kdb_mdr(addr, mdcount);
+		last_addr += mdcount;
+		last_repeat = mdcount;
+		last_bytesperword = bytesperword; // to make REPEAT happy
+		return ret;
+	}
 
 	switch (radix) {
 	case 10:
@@ -2469,7 +2487,7 @@ static void kdb_gmtime(struct timespec *tv, struct kdb_tm *tm)
 static void kdb_sysinfo(struct sysinfo *val)
 {
 	struct timespec uptime;
-	do_posix_clock_monotonic_gettime(&uptime);
+	ktime_get_ts(&uptime);
 	memset(val, 0, sizeof(*val));
 	val->uptime = uptime.tv_sec;
 	val->loads[0] = avenrun[0];

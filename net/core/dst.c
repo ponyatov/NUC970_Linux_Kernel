@@ -142,12 +142,12 @@ loop:
 	mutex_unlock(&dst_gc_mutex);
 }
 
-int dst_discard(struct sk_buff *skb)
+int dst_discard_sk(struct sock *sk, struct sk_buff *skb)
 {
 	kfree_skb(skb);
 	return 0;
 }
-EXPORT_SYMBOL(dst_discard);
+EXPORT_SYMBOL(dst_discard_sk);
 
 const u32 dst_default_metrics[RTAX_MAX + 1] = {
 	/* This initializer is needed to force linker to place this variable
@@ -184,7 +184,7 @@ void *dst_alloc(struct dst_ops *ops, struct net_device *dev,
 	dst->xfrm = NULL;
 #endif
 	dst->input = dst_discard;
-	dst->output = dst_discard;
+	dst->output = dst_discard_sk;
 	dst->error = 0;
 	dst->obsolete = initial_obsolete;
 	dst->header_len = 0;
@@ -209,8 +209,10 @@ static void ___dst_free(struct dst_entry *dst)
 	/* The first case (dev==NULL) is required, when
 	   protocol module is unloaded.
 	 */
-	if (dst->dev == NULL || !(dst->dev->flags&IFF_UP))
-		dst->input = dst->output = dst_discard;
+	if (dst->dev == NULL || !(dst->dev->flags&IFF_UP)) {
+		dst->input = dst_discard;
+		dst->output = dst_discard_sk;
+	}
 	dst->obsolete = DST_OBSOLETE_DEAD;
 }
 
@@ -283,9 +285,7 @@ void dst_release(struct dst_entry *dst)
 		unsigned short nocache = dst->flags & DST_NOCACHE;
 
 		newrefcnt = atomic_dec_return(&dst->__refcnt);
-		if (unlikely(newrefcnt < 0))
-			net_warn_ratelimited("%s: dst:%p refcnt:%d\n",
-					     __func__, dst, newrefcnt);
+		WARN_ON(newrefcnt < 0);
 		if (!newrefcnt && unlikely(nocache))
 			call_rcu(&dst->rcu_head, dst_destroy_rcu);
 	}
@@ -370,7 +370,8 @@ static void dst_ifdown(struct dst_entry *dst, struct net_device *dev,
 		return;
 
 	if (!unregister) {
-		dst->input = dst->output = dst_discard;
+		dst->input = dst_discard;
+		dst->output = dst_discard_sk;
 	} else {
 		dst->dev = dev_net(dst->dev)->loopback_dev;
 		dev_hold(dst->dev);
@@ -381,7 +382,7 @@ static void dst_ifdown(struct dst_entry *dst, struct net_device *dev,
 static int dst_dev_event(struct notifier_block *this, unsigned long event,
 			 void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct dst_entry *dst, *last = NULL;
 
 	switch (event) {
@@ -396,6 +397,20 @@ static int dst_dev_event(struct notifier_block *this, unsigned long event,
 		spin_lock_bh(&dst_garbage.lock);
 		dst = dst_garbage.list;
 		dst_garbage.list = NULL;
+		/* The code in dst_ifdown places a hold on the loopback device.
+		 * If the gc entry processing is set to expire after a lengthy
+		 * interval, this hold can cause netdev_wait_allrefs() to hang
+		 * out and wait for a long time -- until the the loopback
+		 * interface is released.  If we're really unlucky, it'll emit
+		 * pr_emerg messages to console too.  Reset the interval here,
+		 * so dst cleanups occur in a more timely fashion.
+		 */
+		if (dst_garbage.timer_inc > DST_GC_INC) {
+			dst_garbage.timer_inc = DST_GC_INC;
+			dst_garbage.timer_expires = DST_GC_MIN;
+			mod_delayed_work(system_wq, &dst_gc_work,
+					 dst_garbage.timer_expires);
+		}
 		spin_unlock_bh(&dst_garbage.lock);
 
 		if (last)

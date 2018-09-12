@@ -3,7 +3,7 @@
  * for access to MPT (Message Passing Technology) firmware.
  *
  * This code is based on drivers/scsi/mpt3sas/mpt3sas_base.h
- * Copyright (C) 2012  LSI Corporation
+ * Copyright (C) 2012-2014  LSI Corporation
  *  (mailto:DL-MPTFusionLinux@lsi.com)
  *
  * This program is free software; you can redistribute it and/or
@@ -70,10 +70,10 @@
 #define MPT3SAS_DRIVER_NAME		"mpt3sas"
 #define MPT3SAS_AUTHOR	"LSI Corporation <DL-MPTFusionLinux@lsi.com>"
 #define MPT3SAS_DESCRIPTION	"LSI MPT Fusion SAS 3.0 Device Driver"
-#define MPT3SAS_DRIVER_VERSION		"01.100.01.00"
-#define MPT3SAS_MAJOR_VERSION		1
+#define MPT3SAS_DRIVER_VERSION		"04.100.00.00"
+#define MPT3SAS_MAJOR_VERSION		4
 #define MPT3SAS_MINOR_VERSION		100
-#define MPT3SAS_BUILD_VERSION		1
+#define MPT3SAS_BUILD_VERSION		0
 #define MPT3SAS_RELEASE_VERSION	00
 
 /*
@@ -130,7 +130,25 @@
 #define MPT_TARGET_FLAGS_DELETED	0x04
 #define MPT_TARGET_FASTPATH_IO		0x08
 
+/*
+ * Intel HBA branding
+ */
+#define MPT3SAS_INTEL_RMS3JC080_BRANDING       \
+	"Intel(R) Integrated RAID Module RMS3JC080"
+#define MPT3SAS_INTEL_RS3GC008_BRANDING       \
+	"Intel(R) RAID Controller RS3GC008"
+#define MPT3SAS_INTEL_RS3FC044_BRANDING       \
+	"Intel(R) RAID Controller RS3FC044"
+#define MPT3SAS_INTEL_RS3UC080_BRANDING       \
+	"Intel(R) RAID Controller RS3UC080"
 
+/*
+ * Intel HBA SSDIDs
+ */
+#define MPT3SAS_INTEL_RMS3JC080_SSDID	0x3521
+#define MPT3SAS_INTEL_RS3GC008_SSDID	0x3522
+#define MPT3SAS_INTEL_RS3FC044_SSDID	0x3523
+#define MPT3SAS_INTEL_RS3UC080_SSDID    0x3524
 
 /*
  * status bits for ioc->diag_buffer_status
@@ -219,7 +237,6 @@ struct MPT3SAS_TARGET {
  * @eedp_enable: eedp support enable bit
  * @eedp_type: 0(type_1), 1(type_2), 2(type_3)
  * @eedp_block_length: block size
- * @ata_command_pending: SATL passthrough outstanding for device
  */
 struct MPT3SAS_DEVICE {
 	struct MPT3SAS_TARGET *sas_target;
@@ -228,17 +245,6 @@ struct MPT3SAS_DEVICE {
 	u8	configured_lun;
 	u8	block;
 	u8	tlr_snoop_check;
-	/*
-	 * Bug workaround for SATL handling: the mpt2/3sas firmware
-	 * doesn't return BUSY or TASK_SET_FULL for subsequent
-	 * commands while a SATL pass through is in operation as the
-	 * spec requires, it simply does nothing with them until the
-	 * pass through completes, causing them possibly to timeout if
-	 * the passthrough is a long executing command (like format or
-	 * secure erase).  This variable allows us to do the right
-	 * thing while a SATL command is pending.
-	 */
-	unsigned long ata_command_pending;
 };
 
 #define MPT3_CMD_NOT_USED	0x8000	/* free */
@@ -284,8 +290,10 @@ struct _internal_cmd {
  * @channel: target channel
  * @slot: number number
  * @phy: phy identifier provided in sas device page 0
- * @fast_path: fast path feature enable bit
  * @responding: used in _scsih_sas_device_mark_responding
+ * @fast_path: fast path feature enable bit
+ * @pfa_led_on: flag for PFA LED status
+ *
  */
 struct _sas_device {
 	struct list_head list;
@@ -305,6 +313,7 @@ struct _sas_device {
 	u8	phy;
 	u8	responding;
 	u8	fast_path;
+	u8	pfa_led_on;
 };
 
 /**
@@ -560,6 +569,11 @@ struct mpt3sas_port_facts {
 	u16			MaxPostedCmdBuffers;
 };
 
+struct reply_post_struct {
+	Mpi2ReplyDescriptorsUnion_t	*reply_post_free;
+	dma_addr_t			reply_post_free_dma;
+};
+
 /**
  * enum mutex_type - task management mutex type
  * @TM_MUTEX_OFF: mutex is not required becuase calling function is acquiring it
@@ -588,6 +602,7 @@ typedef void (*MPT3SAS_FLUSH_RUNNING_CMDS)(struct MPT3SAS_ADAPTER *ioc);
  * @ir_firmware: IR firmware present
  * @bars: bitmask of BAR's that must be configured
  * @mask_interrupts: ignore interrupt
+ * @dma_mask: used to set the consistent dma mask
  * @fault_reset_work_q_name: fw fault work queue
  * @fault_reset_work_q: ""
  * @fault_reset_work: ""
@@ -703,8 +718,11 @@ typedef void (*MPT3SAS_FLUSH_RUNNING_CMDS)(struct MPT3SAS_ADAPTER *ioc);
  * @reply_free_dma_pool:
  * @reply_free_host_index: tail index in pool to insert free replys
  * @reply_post_queue_depth: reply post queue depth
- * @reply_post_free: pool for reply post (64bit descriptor)
- * @reply_post_free_dma:
+ * @reply_post_struct: struct for reply_post_free physical & virt address
+ * @rdpq_array_capable: FW supports multiple reply queue addresses in ioc_init
+ * @rdpq_array_enable: rdpq_array support is enabled in the driver
+ * @rdpq_array_enable_assigned: this ensures that rdpq_array_enable flag
+ *				is assigned only ones
  * @reply_queue_count: number of reply queue's
  * @reply_queue_list: link list contaning the reply queue info
  * @reply_post_host_index: head index in the pool where FW completes IO
@@ -726,6 +744,7 @@ struct MPT3SAS_ADAPTER {
 	u8		ir_firmware;
 	int		bars;
 	u8		mask_interrupts;
+	int		dma_mask;
 
 	/* fw fault handler */
 	char		fault_reset_work_q_name[20];
@@ -905,8 +924,10 @@ struct MPT3SAS_ADAPTER {
 
 	/* reply post queue */
 	u16		reply_post_queue_depth;
-	Mpi2ReplyDescriptorsUnion_t *reply_post_free;
-	dma_addr_t	reply_post_free_dma;
+	struct reply_post_struct *reply_post;
+	u8		rdpq_array_capable;
+	u8		rdpq_array_enable;
+	u8		rdpq_array_enable_assigned;
 	struct dma_pool *reply_post_free_dma_pool;
 	u8		reply_queue_count;
 	struct list_head reply_queue_list;
@@ -1005,7 +1026,7 @@ void mpt3sas_scsih_reset_handler(struct MPT3SAS_ADAPTER *ioc, int reset_phase);
 
 int mpt3sas_scsih_issue_tm(struct MPT3SAS_ADAPTER *ioc, u16 handle,
 	uint channel, uint id, uint lun, u8 type, u16 smid_task,
-	ulong timeout, unsigned long serial_number,  enum mutex_type m_type);
+	ulong timeout, enum mutex_type m_type);
 void mpt3sas_scsih_set_tm_flag(struct MPT3SAS_ADAPTER *ioc, u16 handle);
 void mpt3sas_scsih_clear_tm_flag(struct MPT3SAS_ADAPTER *ioc, u16 handle);
 void mpt3sas_expander_remove(struct MPT3SAS_ADAPTER *ioc, u64 sas_address);

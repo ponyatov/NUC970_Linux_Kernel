@@ -96,7 +96,7 @@ MODULE_PARM_DESC(max_rds_errors, "RDS maximum block errors: *1*");
  */
 int si470x_get_register(struct si470x_device *radio, int regnr)
 {
-	u16 buf[READ_REG_NUM];
+	__be16 buf[READ_REG_NUM];
 	struct i2c_msg msgs[1] = {
 		{
 			.addr = radio->client->addr,
@@ -121,7 +121,7 @@ int si470x_get_register(struct si470x_device *radio, int regnr)
 int si470x_set_register(struct si470x_device *radio, int regnr)
 {
 	int i;
-	u16 buf[WRITE_REG_NUM];
+	__be16 buf[WRITE_REG_NUM];
 	struct i2c_msg msgs[1] = {
 		{
 			.addr = radio->client->addr,
@@ -151,7 +151,7 @@ int si470x_set_register(struct si470x_device *radio, int regnr)
 static int si470x_get_all_registers(struct si470x_device *radio)
 {
 	int i;
-	u16 buf[READ_REG_NUM];
+	__be16 buf[READ_REG_NUM];
 	struct i2c_msg msgs[1] = {
 		{
 			.addr = radio->client->addr,
@@ -463,7 +463,7 @@ static int si470x_i2c_remove(struct i2c_client *client)
 }
 
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 /*
  * si470x_i2c_suspend - suspend the device
  */
@@ -509,7 +509,7 @@ static struct i2c_driver si470x_i2c_driver = {
 	.driver = {
 		.name		= "si470x",
 		.owner		= THIS_MODULE,
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 		.pm		= &si470x_i2c_pm,
 #endif
 	},

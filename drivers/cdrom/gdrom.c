@@ -497,6 +497,9 @@ static struct cdrom_device_ops gdrom_ops = {
 static int gdrom_bdops_open(struct block_device *bdev, fmode_t mode)
 {
 	int ret;
+
+	check_disk_change(bdev);
+
 	mutex_lock(&gdrom_mutex);
 	ret = cdrom_open(gd.cd_info, bdev, mode);
 	mutex_unlock(&gdrom_mutex);
@@ -561,11 +564,11 @@ static int gdrom_set_interrupt_handlers(void)
 	int err;
 
 	err = request_irq(HW_EVENT_GDROM_CMD, gdrom_command_interrupt,
-		IRQF_DISABLED, "gdrom_command", &gd);
+		0, "gdrom_command", &gd);
 	if (err)
 		return err;
 	err = request_irq(HW_EVENT_GDROM_DMA, gdrom_dma_interrupt,
-		IRQF_DISABLED, "gdrom_dma", &gd);
+		0, "gdrom_dma", &gd);
 	if (err)
 		free_irq(HW_EVENT_GDROM_CMD, &gd);
 	return err;
@@ -602,7 +605,7 @@ static void gdrom_readdisk_dma(struct work_struct *work)
 		spin_unlock(&gdrom_lock);
 		block = blk_rq_pos(req)/GD_TO_BLK + GD_SESSION_OFFSET;
 		block_cnt = blk_rq_sectors(req)/GD_TO_BLK;
-		__raw_writel(virt_to_phys(req->buffer), GDROM_DMA_STARTADDR_REG);
+		__raw_writel(virt_to_phys(bio_data(req->bio)), GDROM_DMA_STARTADDR_REG);
 		__raw_writel(block_cnt * GDROM_HARD_SECTOR, GDROM_DMA_LENGTH_REG);
 		__raw_writel(1, GDROM_DMA_DIRECTION_REG);
 		__raw_writel(1, GDROM_DMA_ENABLE_REG);
@@ -830,9 +833,9 @@ probe_fail_cdrom_register:
 	del_gendisk(gd.disk);
 probe_fail_no_disk:
 	kfree(gd.cd_info);
+probe_fail_no_mem:
 	unregister_blkdev(gdrom_major, GDROM_DEV_NAME);
 	gdrom_major = 0;
-probe_fail_no_mem:
 	pr_warning("Probe failed - error is 0x%X\n", err);
 	return err;
 }

@@ -84,11 +84,16 @@ struct ecryptfs_page_crypt_context {
 static inline struct ecryptfs_auth_tok *
 ecryptfs_get_encrypted_key_payload_data(struct key *key)
 {
-	if (key->type == &key_type_encrypted)
-		return (struct ecryptfs_auth_tok *)
-			(&((struct encrypted_key_payload *)key->payload.data)->payload_data);
-	else
+	struct encrypted_key_payload *payload;
+
+	if (key->type != &key_type_encrypted)
 		return NULL;
+
+	payload = key->payload.data;
+	if (!payload)
+		return ERR_PTR(-EKEYREVOKED);
+
+	return (struct ecryptfs_auth_tok *)payload->payload_data;
 }
 
 static inline struct key *ecryptfs_get_encrypted_key(char *sig)
@@ -114,13 +119,17 @@ static inline struct ecryptfs_auth_tok *
 ecryptfs_get_key_payload_data(struct key *key)
 {
 	struct ecryptfs_auth_tok *auth_tok;
+	struct user_key_payload *ukp;
 
 	auth_tok = ecryptfs_get_encrypted_key_payload_data(key);
-	if (!auth_tok)
-		return (struct ecryptfs_auth_tok *)
-			(((struct user_key_payload *)key->payload.data)->data);
-	else
+	if (auth_tok)
 		return auth_tok;
+
+	ukp = key->payload.data;
+	if (!ukp)
+		return ERR_PTR(-EKEYREVOKED);
+
+	return (struct ecryptfs_auth_tok *)ukp->data;
 }
 
 #define ECRYPTFS_MAX_KEYSET_SIZE 1024
@@ -261,7 +270,10 @@ struct ecryptfs_inode_info {
  * vfsmount too. */
 struct ecryptfs_dentry_info {
 	struct path lower_path;
-	struct ecryptfs_crypt_stat *crypt_stat;
+	union {
+		struct ecryptfs_crypt_stat *crypt_stat;
+		struct rcu_head rcu;
+	};
 };
 
 /**
@@ -512,13 +524,6 @@ ecryptfs_dentry_to_lower(struct dentry *dentry)
 	return ((struct ecryptfs_dentry_info *)dentry->d_fsdata)->lower_path.dentry;
 }
 
-static inline void
-ecryptfs_set_dentry_lower(struct dentry *dentry, struct dentry *lower_dentry)
-{
-	((struct ecryptfs_dentry_info *)dentry->d_fsdata)->lower_path.dentry =
-		lower_dentry;
-}
-
 static inline struct vfsmount *
 ecryptfs_dentry_to_lower_mnt(struct dentry *dentry)
 {
@@ -529,13 +534,6 @@ static inline struct path *
 ecryptfs_dentry_to_lower_path(struct dentry *dentry)
 {
 	return &((struct ecryptfs_dentry_info *)dentry->d_fsdata)->lower_path;
-}
-
-static inline void
-ecryptfs_set_dentry_lower_mnt(struct dentry *dentry, struct vfsmount *lower_mnt)
-{
-	((struct ecryptfs_dentry_info *)dentry->d_fsdata)->lower_path.mnt =
-		lower_mnt;
 }
 
 #define ecryptfs_printk(type, fmt, arg...) \
@@ -575,7 +573,7 @@ int ecryptfs_initialize_file(struct dentry *ecryptfs_dentry,
 			     struct inode *ecryptfs_inode);
 int ecryptfs_decode_and_decrypt_filename(char **decrypted_name,
 					 size_t *decrypted_name_size,
-					 struct dentry *ecryptfs_dentry,
+					 struct super_block *sb,
 					 const char *name, size_t name_size);
 int ecryptfs_fill_zeros(struct file *file, loff_t new_length);
 int ecryptfs_encrypt_and_encode_filename(

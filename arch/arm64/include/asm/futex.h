@@ -24,12 +24,14 @@
 
 #define __futex_atomic_op(insn, ret, oldval, uaddr, tmp, oparg)		\
 	asm volatile(							\
-"1:	ldaxr	%w1, %2\n"						\
+"1:	ldxr	%w1, %2\n"						\
 	insn "\n"							\
 "2:	stlxr	%w3, %w0, %2\n"						\
 "	cbnz	%w3, 1b\n"						\
+"	dmb	ish\n"							\
 "3:\n"									\
 "	.pushsection .fixup,\"ax\"\n"					\
+"	.align	2\n"							\
 "4:	mov	%w0, %w5\n"						\
 "	b	3b\n"							\
 "	.popsection\n"							\
@@ -39,19 +41,19 @@
 "	.popsection\n"							\
 	: "=&r" (ret), "=&r" (oldval), "+Q" (*uaddr), "=&r" (tmp)	\
 	: "r" (oparg), "Ir" (-EFAULT)					\
-	: "cc", "memory")
+	: "memory")
 
 static inline int
-futex_atomic_op_inuser (int encoded_op, u32 __user *uaddr)
+futex_atomic_op_inuser(unsigned int encoded_op, u32 __user *uaddr)
 {
 	int op = (encoded_op >> 28) & 7;
 	int cmp = (encoded_op >> 24) & 15;
-	int oparg = (encoded_op << 8) >> 20;
-	int cmparg = (encoded_op << 20) >> 20;
+	int oparg = (int)(encoded_op << 8) >> 20;
+	int cmparg = (int)(encoded_op << 20) >> 20;
 	int oldval = 0, ret, tmp;
 
 	if (encoded_op & (FUTEX_OP_OPARG_SHIFT << 28))
-		oparg = 1 << oparg;
+		oparg = 1U << (oparg & 0x1f);
 
 	if (!access_ok(VERIFY_WRITE, uaddr, sizeof(u32)))
 		return -EFAULT;
@@ -110,11 +112,12 @@ futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
 		return -EFAULT;
 
 	asm volatile("// futex_atomic_cmpxchg_inatomic\n"
-"1:	ldaxr	%w1, %2\n"
+"1:	ldxr	%w1, %2\n"
 "	sub	%w3, %w1, %w4\n"
 "	cbnz	%w3, 3f\n"
 "2:	stlxr	%w3, %w5, %2\n"
 "	cbnz	%w3, 1b\n"
+"	dmb	ish\n"
 "3:\n"
 "	.pushsection .fixup,\"ax\"\n"
 "4:	mov	%w0, %w6\n"
@@ -126,7 +129,7 @@ futex_atomic_cmpxchg_inatomic(u32 *uval, u32 __user *uaddr,
 "	.popsection\n"
 	: "+r" (ret), "=&r" (val), "+Q" (*uaddr), "=&r" (tmp)
 	: "r" (oldval), "r" (newval), "Ir" (-EFAULT)
-	: "cc", "memory");
+	: "memory");
 
 	*uval = val;
 	return ret;

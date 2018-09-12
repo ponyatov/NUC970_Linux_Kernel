@@ -28,7 +28,6 @@
 #include <linux/percpu.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
-#include <linux/init.h>
 #include <linux/smp.h>
 
 #include <asm/hw_breakpoint.h>
@@ -73,7 +72,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
 	 * If so, DABR will be populated in single_step_dabr_instruction().
 	 */
 	if (current->thread.last_hit_ubp != bp)
-		set_breakpoint(info);
+		__set_breakpoint(info);
 
 	return 0;
 }
@@ -175,8 +174,8 @@ int arch_validate_hwbkpt_settings(struct perf_event *bp)
 	if (cpu_has_feature(CPU_FTR_DAWR)) {
 		length_max = 512 ; /* 64 doublewords */
 		/* DAWR region can't cross 512 boundary */
-		if ((bp->attr.bp_addr >> 10) != 
-		    ((bp->attr.bp_addr + bp->attr.bp_len - 1) >> 10))
+		if ((bp->attr.bp_addr >> 9) !=
+		    ((bp->attr.bp_addr + bp->attr.bp_len - 1) >> 9))
 			return -EINVAL;
 	}
 	if (info->len >
@@ -199,7 +198,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
 
 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
 	regs->msr &= ~MSR_SE;
-	set_breakpoint(info);
+	__set_breakpoint(info);
 	tsk->thread.last_hit_ubp = NULL;
 }
 
@@ -228,10 +227,8 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
 	rcu_read_lock();
 
 	bp = __get_cpu_var(bp_per_reg);
-	if (!bp) {
-		rc = NOTIFY_DONE;
+	if (!bp)
 		goto out;
-	}
 	info = counter_arch_bp(bp);
 
 	/*
@@ -287,7 +284,7 @@ int __kprobes hw_breakpoint_handler(struct die_args *args)
 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
 		perf_bp_event(bp, regs);
 
-	set_breakpoint(info);
+	__set_breakpoint(info);
 out:
 	rcu_read_unlock();
 	return rc;
@@ -296,7 +293,7 @@ out:
 /*
  * Handle single-step exceptions following a DABR hit.
  */
-int __kprobes single_step_dabr_instruction(struct die_args *args)
+static int __kprobes single_step_dabr_instruction(struct die_args *args)
 {
 	struct pt_regs *regs = args->regs;
 	struct perf_event *bp = NULL;
@@ -319,7 +316,7 @@ int __kprobes single_step_dabr_instruction(struct die_args *args)
 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
 		perf_bp_event(bp, regs);
 
-	set_breakpoint(info);
+	__set_breakpoint(info);
 	current->thread.last_hit_ubp = NULL;
 
 	/*

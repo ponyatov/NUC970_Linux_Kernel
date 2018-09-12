@@ -481,7 +481,7 @@ void __inline__ outpp(void __iomem *addr, word p)
 int diva_os_register_irq(void *context, byte irq, const char *name)
 {
 	int result = request_irq(irq, diva_os_irq_wrapper,
-				 IRQF_DISABLED | IRQF_SHARED, name, context);
+				 IRQF_SHARED, name, context);
 	return (result);
 }
 
@@ -591,19 +591,22 @@ static int divas_release(struct inode *inode, struct file *file)
 static ssize_t divas_write(struct file *file, const char __user *buf,
 			   size_t count, loff_t *ppos)
 {
+	diva_xdi_um_cfg_cmd_t msg;
 	int ret = -EINVAL;
 
 	if (!file->private_data) {
 		file->private_data = diva_xdi_open_adapter(file, buf,
-							   count,
+							   count, &msg,
 							   xdi_copy_from_user);
-	}
-	if (!file->private_data) {
-		return (-ENODEV);
+		if (!file->private_data)
+			return (-ENODEV);
+		ret = diva_xdi_write(file->private_data, file,
+				     buf, count, &msg, xdi_copy_from_user);
+	} else {
+		ret = diva_xdi_write(file->private_data, file,
+				     buf, count, NULL, xdi_copy_from_user);
 	}
 
-	ret = diva_xdi_write(file->private_data, file,
-			     buf, count, xdi_copy_from_user);
 	switch (ret) {
 	case -1:		/* Message should be removed from rx mailbox first */
 		ret = -EBUSY;
@@ -622,11 +625,12 @@ static ssize_t divas_write(struct file *file, const char __user *buf,
 static ssize_t divas_read(struct file *file, char __user *buf,
 			  size_t count, loff_t *ppos)
 {
+	diva_xdi_um_cfg_cmd_t msg;
 	int ret = -EINVAL;
 
 	if (!file->private_data) {
 		file->private_data = diva_xdi_open_adapter(file, buf,
-							   count,
+							   count, &msg,
 							   xdi_copy_from_user);
 	}
 	if (!file->private_data) {
