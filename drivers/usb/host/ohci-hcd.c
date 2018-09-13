@@ -1260,6 +1260,11 @@ MODULE_LICENSE ("GPL");
 #define PLATFORM_DRIVER		ohci_hcd_tilegx_driver
 #endif
 
+#ifdef CONFIG_USB_NUC970_OHCI
+#include "ohci-nuc970.c"
+#define PLATFORM_DRIVER		ohci_hcd_nuc970_driver
+#endif
+
 static int __init ohci_hcd_mod_init(void)
 {
 	int retval = 0;
