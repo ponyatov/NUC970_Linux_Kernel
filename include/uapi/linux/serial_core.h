@@ -226,6 +226,9 @@
 /* Rocketport EXPRESS/INFINITY */
 #define PORT_RP2	102
 
+/* NUC970 UART */
+#define PORT_NUC970	133
+
 /* Freescale lpuart */
 #define PORT_LPUART	103
 

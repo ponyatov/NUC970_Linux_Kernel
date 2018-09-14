@@ -91,6 +91,14 @@ obj-$(CONFIG_SERIAL_AR933X)   += ar933x_uart.o
 obj-$(CONFIG_SERIAL_EFM32_UART) += efm32-uart.o
 obj-$(CONFIG_SERIAL_ARC)	+= arc_uart.o
 obj-$(CONFIG_SERIAL_RP2)	+= rp2.o
+
+ifeq ($(CONFIG_OF),y)
+  obj-$(CONFIG_SERIAL_NUC970) += nuc970_serial-dt.o
+else
+  obj-$(CONFIG_SERIAL_NUC970) += nuc970_serial.o
+endif
+
+obj-$(CONFIG_SCUART_NUC970)	+= nuc970_scuart.o
 obj-$(CONFIG_SERIAL_FSL_LPUART)	+= fsl_lpuart.o
 obj-$(CONFIG_SERIAL_MEN_Z135)	+= men_z135_uart.o
 
