@@ -1942,8 +1942,9 @@ static int nuc970_get_groups(struct pinctrl_dev *pctldev, unsigned selector,
  * group is not used since some function use different setting between
  * different ports. for example UART....
  */
-int nuc970_enable(struct pinctrl_dev *pctldev, unsigned selector,
-		unsigned group)
+
+// patch: https://patchwork.kernel.org/patch/4833411/
+int nuc970_set(struct pinctrl_dev *pctldev, unsigned selector, unsigned group)
 {
 	unsigned int i, j;
 	unsigned int reg, offset;
@@ -2003,8 +2004,10 @@ struct pinmux_ops nuc970_pmxops = {
 	.get_functions_count = nuc970_get_functions_count,
 	.get_function_name = nuc970_get_fname,
 	.get_function_groups = nuc970_get_groups,
-	.enable = nuc970_enable,
-	.disable = nuc970_disable,
+// patch: https://patchwork.kernel.org/patch/4833411/
+	//.enable = nuc970_enable,
+	//.disable = nuc970_disable,
+	.set_mux = nuc970_set
 };
 
 static struct pinctrl_desc nuc970_pinctrl_desc = {

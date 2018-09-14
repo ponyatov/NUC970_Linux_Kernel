@@ -47,3 +47,10 @@ obj-$(CONFIG_PINCTRL_SH_PFC)	+= sh-pfc/
 obj-$(CONFIG_PLAT_SPEAR)	+= spear/
 obj-$(CONFIG_ARCH_SUNXI)	+= sunxi/
 obj-$(CONFIG_ARCH_VT8500)	+= vt8500/
+
+ifeq ($(CONFIG_OF),y)
+obj-$(CONFIG_PINCTRL_NUC970)	+= pinctrl-nuc970-dt.o
+else
+obj-$(CONFIG_PINCTRL_NUC970)	+= pinctrl-nuc970.o
+endif
+

@@ -56,6 +56,14 @@ config PINCTRL_BF60x
 	def_bool y if BF60x
 	select PINCTRL_ADI2
 
+config PINCTRL_NUC970
+	bool "NUC970/N9H30 pinctrl driver"
+	depends on ARCH_NUC970
+	select PINMUX
+	select PINCONF
+	help
+	  Say Y here to enable NUC970/N9H30 pinctrl driver
+
 config PINCTRL_AT91
 	bool "AT91 pinctrl driver"
 	depends on OF
