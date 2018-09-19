@@ -48,6 +48,15 @@ $(obj)/Image: vmlinux FORCE
 	$(call if_changed,objcopy)
 	@$(kecho) '  Kernel: $@ is ready'
 
+# disabled for generic use in Buildroot as external kernel
+
+#ifeq ($(CONFIG_CPU_NUC970),y)
+#	cp $@   ../image/970image
+#endif
+#ifeq ($(CONFIG_CPU_N9H30),y)
+#	cp $@   ../image/n9h30image
+#endif
+
 $(obj)/compressed/vmlinux: $(obj)/Image FORCE
 	$(Q)$(MAKE) $(build)=$(obj)/compressed $@
 
@@ -80,6 +89,15 @@ $(obj)/uImage:	$(obj)/zImage FORCE
 	$(call if_changed,uimage)
 	@$(kecho) '  Image $@ is ready'
 
+# disabled for generic use in Buildroot as external kernel
+
+#ifeq ($(CONFIG_CPU_NUC970),y)
+#	cp $@   ../image/970uimage
+#endif
+#ifeq ($(CONFIG_CPU_N9H30),y)
+#	cp $@   ../image/n9h30uimage
+#endif
+
 $(obj)/bootp/bootp: $(obj)/zImage initrd FORCE
 	$(Q)$(MAKE) $(build)=$(obj)/bootp $@
 	@:
@@ -95,15 +113,15 @@ initrd:
 	@test "$(INITRD)" != "" || \
 	(echo You must specify INITRD; exit -1)
 
-install:
+install: $(obj)/Image
 	$(CONFIG_SHELL) $(srctree)/$(src)/install.sh "$(KERNELRELEASE)" \
 	$(obj)/Image System.map "$(INSTALL_PATH)"
 
-zinstall:
+zinstall: $(obj)/zImage
 	$(CONFIG_SHELL) $(srctree)/$(src)/install.sh "$(KERNELRELEASE)" \
 	$(obj)/zImage System.map "$(INSTALL_PATH)"
 
-uinstall:
+uinstall: $(obj)/uImage
 	$(CONFIG_SHELL) $(srctree)/$(src)/install.sh "$(KERNELRELEASE)" \
 	$(obj)/uImage System.map "$(INSTALL_PATH)"
 
