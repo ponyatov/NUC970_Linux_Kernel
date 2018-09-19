@@ -91,9 +91,10 @@ $(obj)/uImage:	$(obj)/zImage FORCE
 
 # disabled for generic use in Buildroot as external kernel
 
-#ifeq ($(CONFIG_CPU_NUC970),y)
+ifeq ($(CONFIG_CPU_NUC970),y)
 #	cp $@   ../image/970uimage
-#endif
+	cp $@ ~/tmp/uImage
+endif
 #ifeq ($(CONFIG_CPU_N9H30),y)
 #	cp $@   ../image/n9h30uimage
 #endif
