@@ -392,7 +392,8 @@ static int pin_check_config(struct nuc970_pinctrl *info, const char *name,
 	return 0;
 }
 
-static int nuc970_pmx_enable(struct pinctrl_dev *pctldev, unsigned selector,
+// patch: https://patchwork.kernel.org/patch/4833411/
+static int nuc970_pmxset(struct pinctrl_dev *pctldev, unsigned selector,
 			   unsigned group)
 {
 	struct nuc970_pinctrl *info = pinctrl_dev_get_drvdata(pctldev);
@@ -484,8 +485,10 @@ static const struct pinmux_ops nuc970_pmx_ops = {
 	.get_functions_count  = nuc970_pmx_get_funcs_count,
 	.get_function_name    = nuc970_pmx_get_func_name,
 	.get_function_groups  = nuc970_pmx_get_groups,
-	.enable               = nuc970_pmx_enable,
-	.disable              = nuc970_pmx_disable,
+// patch: https://patchwork.kernel.org/patch/4833411/
+	//.enable = nuc970_pmx_enable,
+	//.disable = nuc970_pmx_disable,
+	.set_mux = nuc970_pmxset
 };
 
 static int nuc970_pinconf_get(struct pinctrl_dev *pctldev,
